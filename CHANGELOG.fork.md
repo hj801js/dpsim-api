@@ -1,6 +1,6 @@
 # hj801js/dpsim-api — Changelog
 
-Delta from upstream `sogno-platform/dpsim-api@main` (as of 2026-04-17).
+Delta from `sogno-platform/dpsim-api@main` (as of 2026-04-17).
 
 ## Environment-configurable service URLs
 
