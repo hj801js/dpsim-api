@@ -10,12 +10,19 @@ use std::io::Cursor;
 use std::{fs::File,io::Read};
 
 #[cfg(not(test))]
+fn file_service_base() -> String {
+    std::env::var("FILE_SERVICE_URL")
+        .unwrap_or_else(|_| "http://sogno-file-service:8080".into())
+}
+
+#[cfg(not(test))]
 pub async fn post_results_file() -> Result<Box<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let mut form = multipart::Form::default();
     let bytes = Cursor::new("{\"ready\":\"false\"}");
     form.add_reader_file("file", bytes, "ready.json");
-    let req_builder = Request::post("http://sogno-file-service:8080/api/files");
+    let url = format!("{}/api/files", file_service_base());
+    let req_builder = Request::post(url);
     let req = form.set_body_convert::<hyper::Body, multipart::Body>(req_builder)
         .unwrap();
     let mut resp = client.request(req).await?;
@@ -88,7 +95,11 @@ pub async fn get_data_from_url(url: &str) -> Result<Box<Bytes>, hyper::Error> {
 
 #[doc = "Function to get a URL from sogno-file-service using a file ID"]
 pub async fn convert_id_to_url(model_id: &str) -> Result<String, hyper::Error>{
-    let model_id_url = format!("http://sogno-file-service:8080/api/files/{}", model_id);
+    #[cfg(not(test))]
+    let base = file_service_base();
+    #[cfg(test)]
+    let base = String::from("http://sogno-file-service:8080");
+    let model_id_url = format!("{}/api/files/{}", base, model_id);
     let data = get_data_from_url(&model_id_url).await;
     let url = match data {
         Ok(boxed_data) => {
