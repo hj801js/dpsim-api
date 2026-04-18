@@ -48,7 +48,8 @@ fn get_docs() -> SwaggerUIConfig {
 #[doc = "The main entry point for Rocket" ]
 async fn main() -> Result <(), rocket::Error> {
 
-    if telemetry::init() {
+    let otel_on = telemetry::init();
+    if otel_on {
         eprintln!("[otel] exporting spans to {}",
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default());
     }
@@ -65,6 +66,7 @@ async fn main() -> Result <(), rocket::Error> {
         .mount("/metrics", prometheus.clone())
         .attach(prometheus)
         .attach(Template::fairing())
+        .attach(telemetry::TracingFairing)
         .launch()
         .await
         .map(|_| ())

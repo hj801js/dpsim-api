@@ -8,7 +8,10 @@ use opentelemetry::{global, KeyValue};
 use opentelemetry::trace::{SpanBuilder, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
-use std::sync::OnceLock;
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::{Data, Request, Response};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 static SDK_PROVIDER: OnceLock<sdktrace::TracerProvider> = OnceLock::new();
 
@@ -110,4 +113,114 @@ fn hex_span_id(id: SpanId) -> String {
 #[allow(dead_code)]
 pub fn make_context(trace_id: TraceId, span_id: SpanId) -> SpanContext {
     SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default())
+}
+
+// ---------------------------------------------------------------------------
+// Rocket fairing — per-request span that wraps the whole route handler.
+//
+// P2.2d replaces the stub `start_post_simulation_span()` (which ended
+// immediately and thus reported dur=0ms in Jaeger) with a fairing that
+// starts a span on on_request and ends it on on_response. The child span
+// we mint inside post_simulation for AMQP publish now inherits the real
+// request trace via Rocket's current-span tracking.
+// ---------------------------------------------------------------------------
+
+struct RequestSpanSlot {
+    span: Option<opentelemetry::global::BoxedSpan>,
+    /// Snapshot of the fairing span's context so handlers can hand it to the
+    /// AMQP publisher without needing a mutable reference to the live span.
+    ctx: Option<SpanContext>,
+    started: Instant,
+}
+
+/// Retrieve the fairing-attached span context for a request, if any. Used by
+/// post_simulation to propagate the same trace id into AMQP as the fairing
+/// emits to Jaeger.
+pub fn request_span_context(req: &Request<'_>) -> Option<SpanContext> {
+    let slot = req.local_cache::<Mutex<RequestSpanSlot>, _>(|| {
+        Mutex::new(RequestSpanSlot { span: None, ctx: None, started: Instant::now() })
+    });
+    slot.lock().ok().and_then(|s| s.ctx.clone())
+}
+
+/// Request guard that exposes the fairing span context to handlers. Always
+/// succeeds; `.0` is `None` when OTel is off or the fairing didn't run.
+pub struct RequestSpanCtx(pub Option<SpanContext>);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for RequestSpanCtx {
+    type Error = ();
+    async fn from_request(
+        req: &'r Request<'_>,
+    ) -> rocket::request::Outcome<Self, Self::Error> {
+        rocket::outcome::Outcome::Success(RequestSpanCtx(request_span_context(req)))
+    }
+}
+
+impl<'r> rocket_okapi::request::OpenApiFromRequest<'r> for RequestSpanCtx {
+    fn from_request_input(
+        _gen: &mut rocket_okapi::gen::OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> rocket_okapi::Result<rocket_okapi::request::RequestHeaderInput> {
+        Ok(rocket_okapi::request::RequestHeaderInput::None)
+    }
+}
+
+pub struct TracingFairing;
+
+#[rocket::async_trait]
+impl Fairing for TracingFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "opentelemetry-request-span",
+            kind: Kind::Request | Kind::Response,
+        }
+    }
+
+    async fn on_request(&self, req: &mut Request<'_>, _: &mut Data<'_>) {
+        use opentelemetry::trace::Span as _;
+        if SDK_PROVIDER.get().is_none() {
+            return;
+        }
+        let tracer = global::tracer("dpsim-api");
+        let mut span = tracer.build(
+            SpanBuilder::from_name(format!("{} {}", req.method(), req.uri().path()))
+                .with_kind(SpanKind::Server),
+        );
+        span.set_attribute(KeyValue::new("http.method", req.method().as_str().to_string()));
+        span.set_attribute(KeyValue::new("http.target", req.uri().path().to_string()));
+        let ctx = span.span_context().clone();
+        let slot = Mutex::new(RequestSpanSlot {
+            span: Some(span),
+            ctx: Some(ctx),
+            started: Instant::now(),
+        });
+        req.local_cache(|| slot);
+    }
+
+    async fn on_response<'r>(&self, req: &'r Request<'_>, resp: &mut Response<'r>) {
+        use opentelemetry::trace::Span as _;
+        if SDK_PROVIDER.get().is_none() {
+            return;
+        }
+        let slot = req.local_cache::<Mutex<RequestSpanSlot>, _>(|| {
+            Mutex::new(RequestSpanSlot { span: None, ctx: None, started: Instant::now() })
+        });
+        let mut guard = slot.lock().unwrap();
+        if let Some(mut span) = guard.span.take() {
+            span.set_attribute(KeyValue::new("http.status_code", resp.status().code as i64));
+            span.set_attribute(KeyValue::new(
+                "http.duration_ms",
+                guard.started.elapsed().as_millis() as i64,
+            ));
+            span.end();
+            // NB: we don't call provider.force_flush() here. The OTLP HTTP
+            // exporter blocks on the response while holding Rocket's request
+            // thread, producing a hang under load. The flush happens in
+            // start_post_simulation_span (which runs mid-handler on its own
+            // blocking call) and on process exit. Worst case a request span
+            // takes up to BatchSpanProcessor's 5s scheduled flush to appear.
+        }
+    }
 }

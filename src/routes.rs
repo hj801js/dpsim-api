@@ -405,7 +405,11 @@ pub async fn get_simulations(user: MaybeAuthedUser) -> Result<Json<SimulationArr
 #[doc = "Create a new simulation"]
 #[openapi]
 #[post("/simulation", format = "application/json", data = "<form>")]
-pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > ) -> SimulationResult {
+pub async fn post_simulation(
+    user: MaybeAuthedUser,
+    req_span: crate::telemetry::RequestSpanCtx,
+    form: Json<SimulationForm>,
+) -> SimulationResult {
     if auth_required() && user.0.is_none() {
         return Err(SimulationError {
             err: "authentication required".into(),
@@ -430,11 +434,11 @@ pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > 
             }
             let outage           = form_outage.clone();
             let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url, outage, form_load_factor);
-            // P2.2c — if OTel is initialized, mint a real span context here
-            // so the AMQP traceparent header carries the dpsim-api trace id
-            // instead of our padded short id. Worker's extract will see the
-            // API span as the parent of dpsim-worker.on_msg.
-            let span_ctx         = crate::telemetry::start_post_simulation_span();
+            // P2.2d — reuse the fairing's request span context so AMQP
+            // publishes land in the same trace Jaeger already knows about.
+            // Falls back to a fresh span when OTel isn't initialised.
+            let span_ctx         = req_span.0.clone()
+                .or_else(crate::telemetry::start_post_simulation_span);
             let traceparent      = span_ctx.as_ref()
                 .and_then(crate::telemetry::span_context_to_traceparent);
             match block_on(amqp::request_simulation_with_traceparent(
