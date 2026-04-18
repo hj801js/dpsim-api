@@ -86,6 +86,8 @@ mod db {
     pub fn write_simulation(_key: &String, _value: &Simulation) -> redis::RedisResult<()> {
         Ok(())
     }
+    pub fn revoke_token_sig(_sig: &str, _ttl_secs: u64) -> bool { false }
+    pub fn is_token_sig_revoked(_sig: &str) -> bool { false }
     pub fn read_simulation(_key: u64) -> redis::RedisResult<Simulation> {
         Ok(Simulation {
                error:           "".to_owned(),

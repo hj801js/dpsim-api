@@ -93,6 +93,67 @@ pub async fn insert_simulation(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// User store (session 28). In-memory HashMap in auth.rs stays as fallback
+// for tests and DATABASE_URL-less runs; when PG is on these are the
+// authoritative paths.
+// ---------------------------------------------------------------------------
+
+/// Result of create_user: Created holds the new row; Conflict means email
+/// already exists. Errors bubble from sqlx only for real DB problems.
+pub enum UserCreateResult {
+    Created { user_id: String, email: String, password_hash: String },
+    Conflict,
+}
+
+pub async fn insert_user(
+    email: &str,
+    password_hash: &str,
+) -> Result<UserCreateResult, sqlx::Error> {
+    let Some(p) = pool().await else {
+        // Caller treats None-pool as "pg disabled"; signal with a distinct
+        // error. The pg-less path in auth.rs will fall back to the HashMap.
+        return Err(sqlx::Error::Configuration("pg disabled".into()));
+    };
+    // INSERT ... RETURNING ... is the sqlx way; Conflict (unique violation)
+    // comes back as Database error we coerce to a Conflict variant.
+    let res = sqlx::query_as::<_, (sqlx::types::Uuid, String, String)>(
+        "INSERT INTO users (email, password_hash)
+         VALUES ($1, $2)
+         RETURNING user_id, email::text, password_hash",
+    )
+    .bind(email)
+    .bind(password_hash)
+    .fetch_one(&p)
+    .await;
+    match res {
+        Ok((uuid, em, hash)) => Ok(UserCreateResult::Created {
+            user_id: uuid.to_string(),
+            email: em,
+            password_hash: hash,
+        }),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            Ok(UserCreateResult::Conflict)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn get_user_by_email(
+    email: &str,
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    let Some(p) = pool().await else {
+        return Err(sqlx::Error::Configuration("pg disabled".into()));
+    };
+    let row = sqlx::query_as::<_, (sqlx::types::Uuid, String, String)>(
+        "SELECT user_id, email::text, password_hash FROM users WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(&p)
+    .await?;
+    Ok(row.map(|(uuid, em, hash)| (uuid.to_string(), em, hash)))
+}
+
 /// Return the N most recent simulations from PG, optionally scoped to a user.
 /// None when PG disabled.
 pub async fn list_recent(

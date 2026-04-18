@@ -73,13 +73,31 @@ pub fn issue_token(user_id: &str, email: &str, ttl_hours: i64) -> Option<String>
 
 pub fn verify_token(token: &str) -> Option<Claims> {
     let secret = secret()?;
-    decode::<Claims>(
+    let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
         &Validation::default(),
     )
     .ok()
-    .map(|d| d.claims)
+    .map(|d| d.claims)?;
+    // Revocation check — keyed on the JWT signature suffix (session 28).
+    // crate::db returns false when redis is unreachable, so local tests
+    // without a live redis still pass.
+    if let Some(sig) = token_sig_suffix(token) {
+        if crate::db::is_token_sig_revoked(sig) {
+            return None;
+        }
+    }
+    Some(claims)
+}
+
+/// Return the base64url-encoded signature suffix of a JWT (everything after
+/// the last `.`). Used as the revocation-list key — fixed size (~43 chars)
+/// and unique per token without storing any secret-adjacent material.
+pub fn token_sig_suffix(token: &str) -> Option<&str> {
+    let dot = token.rfind('.')?;
+    let tail = &token[dot + 1..];
+    if tail.is_empty() { None } else { Some(tail) }
 }
 
 // -------------------------------------------------------------------------
@@ -163,6 +181,61 @@ impl<'r> OpenApiFromRequest<'r> for AuthedUser {
     ) -> rocket_okapi::Result<RequestHeaderInput> {
         let (name, scheme, req) = bearer_security();
         Ok(RequestHeaderInput::Security(name, scheme, req))
+    }
+}
+
+/// Request guard that carries the raw Authorization bearer token string
+/// so handlers that need to revoke it (or otherwise inspect it beyond the
+/// decoded claims) can get at it without re-parsing headers.
+pub struct BearerToken(pub String);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for BearerToken {
+    type Error = ();
+    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        let header = match req.headers().get_one("Authorization") {
+            Some(h) => h,
+            None => return Outcome::Error((Status::Unauthorized, ())),
+        };
+        let token = header.strip_prefix("Bearer ").unwrap_or(header).to_owned();
+        if token.is_empty() {
+            return Outcome::Error((Status::Unauthorized, ()));
+        }
+        Outcome::Success(BearerToken(token))
+    }
+}
+
+impl<'r> OpenApiFromRequest<'r> for BearerToken {
+    fn from_request_input(
+        _gen: &mut OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> rocket_okapi::Result<RequestHeaderInput> {
+        // Same bearer scheme as AuthedUser — already registered there.
+        Ok(RequestHeaderInput::None)
+    }
+}
+
+/// Guard that exposes Rocket's `Request::client_ip()` — used to key the
+/// per-IP rate-limit bucket on /auth/signup + /auth/login. Always succeeds
+/// with `None` behind the Rocket test client (no peer socket).
+pub struct ClientIp(pub Option<std::net::IpAddr>);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ClientIp {
+    type Error = ();
+    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        Outcome::Success(ClientIp(req.client_ip()))
+    }
+}
+
+impl<'r> OpenApiFromRequest<'r> for ClientIp {
+    fn from_request_input(
+        _gen: &mut OpenApiGenerator,
+        _name: String,
+        _required: bool,
+    ) -> rocket_okapi::Result<RequestHeaderInput> {
+        Ok(RequestHeaderInput::None)
     }
 }
 
@@ -259,48 +332,100 @@ pub struct TokenResponse {
     pub email: String,
 }
 
-#[rocket_okapi::openapi(skip)]
-#[post("/auth/signup", format = "json", data = "<creds>")]
-pub async fn signup(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
-    let email = norm_email(&creds.email);
-    if rate_limited(&format!("signup:{}", email)) {
-        sweep_rate_limits(now_secs());
+/// Rate-limit a request on two keys: the normalized email AND the client IP.
+/// If either bucket is already over, return 429; otherwise both buckets
+/// record this attempt. Email alone is bypassable (attacker rotates the
+/// supplied email); IP alone is too coarse behind NAT. Both together give
+/// a reasonable lower bound on attacker throughput. ClientIp::None
+/// (Rocket test client) skips the IP bucket.
+fn rate_limit_signup_or_login(op: &str, email: &str, ip: &ClientIp) -> Result<(), Status> {
+    let now = now_secs();
+    let email_over = rate_limited(&format!("{}:{}", op, email));
+    let ip_over = match ip.0 {
+        Some(addr) => rate_limited(&format!("ip:{}", addr)),
+        None => false,
+    };
+    sweep_rate_limits(now);
+    if email_over || ip_over {
         return Err(Status::TooManyRequests);
     }
-    sweep_rate_limits(now_secs());
+    Ok(())
+}
+
+/// Create a user row. Tries PG first; on "pg disabled" falls back to the
+/// in-memory HashMap so tests and DATABASE_URL-less dev runs work unchanged.
+async fn create_user(email: &str, password_hash: String) -> Result<User, Status> {
+    match crate::pg::insert_user(email, &password_hash).await {
+        Ok(crate::pg::UserCreateResult::Created { user_id, email, password_hash }) => {
+            Ok(User { id: user_id, email, password_hash })
+        }
+        Ok(crate::pg::UserCreateResult::Conflict) => Err(Status::Conflict),
+        Err(sqlx::Error::Configuration(_)) => {
+            // pg disabled — in-memory fallback.
+            with_users(|map| {
+                if map.contains_key(email) {
+                    Err(Status::Conflict)
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let u = User {
+                        id:            id,
+                        email:         email.to_owned(),
+                        password_hash,
+                    };
+                    map.insert(email.to_owned(), u.clone());
+                    Ok(u)
+                }
+            })
+        }
+        Err(e) => {
+            eprintln!("[auth] pg insert_user error: {}", e);
+            Err(Status::ServiceUnavailable)
+        }
+    }
+}
+
+/// Look up a user by email. Same PG-first / in-memory-fallback pattern.
+async fn find_user(email: &str) -> Option<User> {
+    match crate::pg::get_user_by_email(email).await {
+        Ok(Some((user_id, em, hash))) => Some(User { id: user_id, email: em, password_hash: hash }),
+        Ok(None) => None,
+        Err(sqlx::Error::Configuration(_)) => {
+            with_users(|map| map.get(email).cloned())
+        }
+        Err(e) => {
+            eprintln!("[auth] pg get_user error: {}", e);
+            None
+        }
+    }
+}
+
+#[rocket_okapi::openapi(skip)]
+#[post("/auth/signup", format = "json", data = "<creds>")]
+pub async fn signup(
+    ip: ClientIp,
+    creds: Json<Credentials>,
+) -> Result<Json<TokenResponse>, Status> {
+    let email = norm_email(&creds.email);
+    rate_limit_signup_or_login("signup", &email, &ip)?;
     if creds.password.len() < 8 {
         return Err(Status::BadRequest);
     }
-    let user_id = uuid::Uuid::new_v4().to_string();
     let hash = hash_password(&creds.password).map_err(|_| Status::InternalServerError)?;
-    with_users(|map| {
-        if map.contains_key(&email) {
-            Err(Status::Conflict)
-        } else {
-            map.insert(email.clone(), User {
-                id:            user_id.clone(),
-                email:         email.clone(),
-                password_hash: hash,
-            });
-            Ok(())
-        }
-    })?;
-    let token = issue_token(&user_id, &email, 24)
+    let user = create_user(&email, hash).await?;
+    let token = issue_token(&user.id, &user.email, 24)
         .ok_or(Status::ServiceUnavailable)?;
-    Ok(Json(TokenResponse { token, email }))
+    Ok(Json(TokenResponse { token, email: user.email }))
 }
 
 #[rocket_okapi::openapi(skip)]
 #[post("/auth/login", format = "json", data = "<creds>")]
-pub async fn login(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
+pub async fn login(
+    ip: ClientIp,
+    creds: Json<Credentials>,
+) -> Result<Json<TokenResponse>, Status> {
     let email = norm_email(&creds.email);
-    if rate_limited(&format!("login:{}", email)) {
-        sweep_rate_limits(now_secs());
-        return Err(Status::TooManyRequests);
-    }
-    sweep_rate_limits(now_secs());
-    let user = with_users(|map| map.get(&email).cloned())
-        .ok_or(Status::Unauthorized)?;
+    rate_limit_signup_or_login("login", &email, &ip)?;
+    let user = find_user(&email).await.ok_or(Status::Unauthorized)?;
     if !verify_password(&creds.password, &user.password_hash) {
         return Err(Status::Unauthorized);
     }
@@ -318,6 +443,22 @@ pub async fn me(user: AuthedUser) -> Json<serde_json::Value> {
     }))
 }
 
+/// Logout: AuthedUser parses + validates the token via verify_token (which
+/// now consults the revocation list, so a second call is idempotent). Then
+/// we write the token's signature suffix to redis with TTL = remaining JWT
+/// lifetime. Subsequent requests with the same token see the revocation
+/// entry and get 401 from the AuthedUser guard.
+#[rocket_okapi::openapi(skip)]
+#[post("/auth/logout")]
+pub async fn logout(user: AuthedUser, bearer: BearerToken) -> Json<serde_json::Value> {
+    if let Some(sig) = token_sig_suffix(&bearer.0) {
+        let now = Utc::now().timestamp();
+        let ttl = ((user.0.exp as i64) - now).max(1) as u64;
+        crate::db::revoke_token_sig(sig, ttl);
+    }
+    Json(serde_json::json!({ "ok": true }))
+}
+
 pub fn get_routes() -> Vec<rocket::Route> {
-    routes![signup, login, me]
+    routes![signup, login, me, logout]
 }

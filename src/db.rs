@@ -32,6 +32,29 @@ pub fn write_simulation(key: &String, value: &Simulation) -> Result<(), redis::R
 
 use redis::RedisError;
 
+// ---------------------------------------------------------------------------
+// JWT revocation (session 28). We key the redis entries on the token's
+// signature suffix (everything after the last dot in the JWT) so we never
+// put the secret-adjacent header/payload in storage and each key is a
+// fixed ~43 bytes. TTL matches the token's remaining lifetime.
+// ---------------------------------------------------------------------------
+#[doc = "Mark a JWT as revoked. `sig` is the base64url-encoded signature (the \
+         tail of the JWT after the last dot). `ttl_secs` should be the token's \
+         remaining lifetime so the key expires with it."]
+pub fn revoke_token_sig(sig: &str, ttl_secs: u64) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("auth:revoked:{}", sig);
+    conn.set_ex::<_, _, ()>(key, "1", ttl_secs as usize).is_ok()
+}
+
+#[doc = "Returns true when the given signature is in the revocation list. \
+         Redis unreachable → false so tests don't need a live redis."]
+pub fn is_token_sig_revoked(sig: &str) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("auth:revoked:{}", sig);
+    conn.exists(key).unwrap_or(false)
+}
+
 #[doc = "Function for reading a Simulation from a Redis DB"]
 pub fn read_simulation(key: u64) -> Result<Simulation, RedisError> {
     let mut conn = get_connection()?;

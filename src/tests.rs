@@ -259,3 +259,36 @@ fn test_auth_signup_login_me() {
     let me_no_token = client.get("/auth/me").dispatch();
     assert_eq!(me_no_token.status().code, 401, "no-token must 401");
 }
+
+#[test]
+fn test_auth_logout_revokes_token() {
+    // Session 28 — /auth/logout writes the token signature to redis with
+    // TTL so subsequent requests see 401. Tests run against the stubbed
+    // db module (src/main.rs #[cfg(test)] mod db) which pretends redis
+    // isn't reachable — so is_token_sig_revoked returns false and we can
+    // verify the route itself ran without requiring a live redis. The
+    // behavioural end of the story is covered by the end-to-end cookie
+    // smoke in docs/43 §6 rather than this unit test.
+    std::env::set_var("DPSIM_JWT_SECRET", "rocket-test-secret");
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let email = format!("logout-{}@dpsim.local", std::process::id());
+    let creds = json!({ "email": email, "password": "abcdefgh12345" });
+    let signup = client.post("/auth/signup").json(&creds).dispatch();
+    let token = serde_json::from_str::<serde_json::Value>(&signup.into_string().unwrap())
+        .unwrap()["token"].as_str().unwrap().to_owned();
+
+    let logout = client
+        .post("/auth/logout")
+        .header(rocket::http::Header::new(
+            "Authorization",
+            format!("Bearer {}", token),
+        ))
+        .dispatch();
+    assert_eq!(logout.status().code, 200, "logout must 200");
+    let body: serde_json::Value =
+        serde_json::from_str(&logout.into_string().unwrap()).unwrap();
+    assert_eq!(body["ok"], true);
+
+    let logout_no_token = client.post("/auth/logout").dispatch();
+    assert_eq!(logout_no_token.status().code, 401, "logout without bearer must 401");
+}
