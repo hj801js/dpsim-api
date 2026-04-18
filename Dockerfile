@@ -1,33 +1,36 @@
-FROM alpine:latest AS builder
+# Debian slim instead of Alpine — our crate set (sqlx, jsonwebtoken, argon2,
+# rocket_prometheus) pulls native OpenSSL / libpq bindings that don't build
+# cleanly against musl. Image is ~80 MB bigger but the build just works.
+FROM rust:1-slim-bookworm AS builder
 
-RUN apk update
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
 
-# ============
-#    DPSim
-# ===========
-
-# Toolchain
-RUN apk add openssl-dev rustup build-base
-RUN rustup-init -y --default-toolchain stable
-RUN source $HOME/.cargo/env && rustc --version
-RUN mkdir -p /usr/src/dpsim-api
-COPY Rocket.toml Cargo.toml Cargo.lock /usr/src/dpsim-api/
 WORKDIR /usr/src/dpsim-api
-RUN mkdir /usr/src/dpsim-api/src
-RUN touch /usr/src/dpsim-api/src/lib.rs
-# The cargo build here will build the dependencies
-# in a preparatory step, reducing docker build times
-RUN source $HOME/.cargo/env && cargo build -r
-COPY src/ /usr/src/dpsim-api/src
-COPY templates/ /usr/src/dpsim-api/templates
-RUN rm /usr/src/dpsim-api/src/lib.rs
-RUN source $HOME/.cargo/env && cargo build -r
+# Copy manifest + build.rs first so dependency compilation can be cached.
+COPY Cargo.toml Cargo.lock Rocket.toml build.rs ./
+RUN mkdir -p src && echo 'fn main(){}' > src/main.rs && cargo build --release \
+    && rm -rf src
 
-FROM alpine:latest
-COPY --from=builder /usr/src/dpsim-api/target/release/dpsim-api /usr/bin
+COPY src/       ./src/
+COPY templates/ ./templates/
+# Force cargo to rebuild the binary crate (touch to invalidate the stub above).
+RUN touch src/main.rs && cargo build --release
+
+# Runtime image — keeps TLS / certs for the sqlx tokio-rustls build.
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libssl3 ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/dpsim-api/target/release/dpsim-api /usr/bin/dpsim-api
 COPY --from=builder /usr/src/dpsim-api/templates/ /usr/bin/templates/
 COPY --from=builder /usr/src/dpsim-api/Rocket.toml /usr/bin/Rocket.toml
 WORKDIR /usr/bin
 EXPOSE 8000
-CMD /usr/bin/dpsim-api
-
+HEALTHCHECK --interval=5s --timeout=2s --retries=10 \
+    CMD wget -q -O- http://localhost:8000/healthz || exit 1
+CMD ["/usr/bin/dpsim-api"]
