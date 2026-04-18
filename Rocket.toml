@@ -1,9 +1,12 @@
 [global.limits]
-# The zip files for the load profile data
-# are about 14MiB, so that + spare
-# is: 32 * 1024 * 1024 (32MiB)
+# The zip files for the load profile data are about 14 MiB, so + spare →
+# 32 MiB for form/file. P4.5 input hardening: cap raw JSON body at 256 KiB
+# (enough for parameter submission) and raw bytes at 16 MiB (matches
+# post_model's explicit check). String forms stay at Rocket's default 8 KiB.
 data-form = 33554432
 file = 33554432
+json = 262144
+bytes = 16777216
 
 [global]
 address = "0.0.0.0"

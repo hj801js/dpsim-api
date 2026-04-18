@@ -108,6 +108,7 @@ pub async fn request_simulation(_simulation: &AMQPSimulation) -> Result<()> {
       },
       "load_profile" : load_profile,
       "parameters": {
+        "simulation_id":   _simulation.simulation_id,
         "simulation_type": _simulation.simulation_type,
         "domain":          _simulation.domain,
         "solver":          _simulation.solver,

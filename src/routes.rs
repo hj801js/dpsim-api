@@ -4,6 +4,8 @@ use async_global_executor::block_on;
 use crate::db;
 use crate::amqp;
 use crate::amqp::AMQPSimulation;
+use crate::auth::{auth_required, MaybeAuthedUser};
+use crate::pg;
 use rocket_dyn_templates::{Template};
 use std::{ str, fmt };
 use rocket_okapi::{ openapi, OpenApiError,
@@ -125,7 +127,10 @@ pub struct SimulationForm {
     pub finaltime:         u64
 }
 
-async fn parse_simulation_form(form: Json<SimulationForm>) -> Result<Json<Simulation>, SimulationError>{
+async fn parse_simulation_form(
+    form: Json<SimulationForm>,
+    user_sub: Option<&str>,
+) -> Result<Json<Simulation>, SimulationError>{
     // Sanity-check numeric bounds before allocating a simulation id so the
     // caller gets a 400 instead of a row in redis + a queued job. The worker
     // clamps these too (examples/service-stack/worker.py::clamp_params), but
@@ -168,7 +173,14 @@ async fn parse_simulation_form(form: Json<SimulationForm>) -> Result<Json<Simula
         finaltime:       form.finaltime
     };
     match db::write_simulation(&simulation_id.to_string(), &simulation) {
-        Ok(()) => Ok(Json(simulation)),
+        Ok(()) => {
+            // Best-effort mirror to PG. Errors logged, never propagated —
+            // redis remains authoritative until the PG flip-over lands.
+            if let Err(e) = pg::insert_simulation(&simulation, user_sub).await {
+                info!("pg mirror failed (continuing on redis only): {}", e);
+            }
+            Ok(Json(simulation))
+        },
         Err(e) => Err(SimulationError {
                       err: format!("Could not write to db: {}", e.to_string()),
                       http_status_code: Status::BadGateway
@@ -275,6 +287,19 @@ pub async fn get_healthz() -> &'static str {
     "ok"
 }
 
+#[openapi(skip)]
+#[doc = "Version probe — returns build-time package version + short git SHA so \
+         deployments can be pinpointed. SHA is injected by build.rs; falls back \
+         to \"unknown\" for builds outside a git checkout."]
+#[get("/version")]
+pub async fn get_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name":    env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": env!("DPSIM_API_GIT_SHA"),
+    }))
+}
+
 #[doc = "Get the details for a simulation"]
 #[openapi]
 #[get("/simulation/<id>", format="application/json")]
@@ -314,7 +339,19 @@ pub struct SimulationArray {
 #[doc = "List the simulations"]
 #[openapi]
 #[get("/simulation", format="application/json")]
-pub async fn get_simulations() -> Result<Json<SimulationArray>, SimulationError> {
+pub async fn get_simulations(user: MaybeAuthedUser) -> Result<Json<SimulationArray>, SimulationError> {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+    // Prefer PG (survives redis flush, supports per-user filtering). Fall
+    // back to the legacy redis scan when PG is off or the query fails.
+    let user_sub = user.0.as_ref().map(|c| c.sub.as_str());
+    if let Some(summaries) = pg::list_recent(100, user_sub).await {
+        return Ok(Json(SimulationArray { simulations: summaries }));
+    }
     match db::get_number_of_simulations() {
         Ok(number_of_simulations) => {
             let mut simvec = Vec::new();
@@ -346,8 +383,15 @@ pub async fn get_simulations() -> Result<Json<SimulationArray>, SimulationError>
 #[doc = "Create a new simulation"]
 #[openapi]
 #[post("/simulation", format = "application/json", data = "<form>")]
-pub async fn post_simulation(form: Json<SimulationForm > ) -> SimulationResult {
-    match parse_simulation_form(form).await {
+pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > ) -> SimulationResult {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+    let user_sub = user.0.as_ref().map(|c| c.sub.clone());
+    match parse_simulation_form(form, user_sub.as_deref()).await {
         Ok(simulation) => {
             let model_id         = &simulation.model_id;
             let load_profile_id  = &simulation.load_profile_id;
@@ -372,6 +416,57 @@ pub async fn post_simulation(form: Json<SimulationForm > ) -> SimulationResult {
     }
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct ModelUploadResponse {
+    pub model_id: String,
+    pub bytes: usize,
+}
+
+#[openapi(skip)]
+#[doc = "Upload a CIM model (raw bytes in the request body). Returns the \
+         model_id the client should pass to POST /simulation. 16 MiB cap \
+         enforced explicitly with 413 on overflow."]
+#[post("/models", data = "<body>")]
+pub async fn post_model(
+    user: MaybeAuthedUser,
+    body: rocket::data::Data<'_>,
+) -> Result<Json<ModelUploadResponse>, SimulationError> {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+    use rocket::data::ToByteUnit;
+    // 16 MiB — enough for IEEE-39 CIM bundles (typically a few hundred KB to
+    // a few MB). Over this we 413 rather than silently truncating.
+    let bytes = body.open(16_u32.mebibytes())
+        .into_bytes()
+        .await
+        .map_err(|e| SimulationError {
+            err: format!("failed to read upload body: {}", e),
+            http_status_code: Status::PayloadTooLarge,
+        })?;
+    if !bytes.is_complete() {
+        return Err(SimulationError {
+            err: "upload exceeds 16 MiB limit".into(),
+            http_status_code: Status::PayloadTooLarge,
+        });
+    }
+    let bytes_vec = bytes.into_inner();
+    let len = bytes_vec.len();
+    // CIM XML is the only format the worker accepts today; hard-code the
+    // content type to text/xml when forwarding to file-service.
+    let model_id = file_service::put_model_bytes(bytes_vec, "application/xml")
+        .await
+        .map_err(|e| SimulationError {
+            err: format!("file-service upload failed: {}", e),
+            http_status_code: Status::BadGateway,
+        })?;
+    info!("uploaded model {} ({} bytes)", model_id, len);
+    Ok(Json(ModelUploadResponse { model_id, bytes: len }))
+}
+
 #[doc = "Create a link to the documentation page for the given function"]
 fn document_link(fn_name: &str) -> String {
     format!("https://sogno-platform.github.io/dpsim-api/dpsim_api/routes/fn.{}{}", fn_name, ".html")
@@ -386,5 +481,5 @@ pub async fn incomplete_form(form: &rocket::Request<'_>) -> String {
 
 #[doc = "Returns the list of routes that we have defined"]
 pub fn get_routes() -> Vec<rocket::Route>{
-    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_simulations, post_simulation, get_simulation_id]
+    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_version, get_simulations, post_simulation, post_model, get_simulation_id]
 }

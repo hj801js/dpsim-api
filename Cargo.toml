@@ -5,10 +5,10 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-rocket = { version = "0.5.0-rc.1", features = [ "json" ] }
+rocket = { version = "0.5", features = [ "json" ] }
 serde = { version = "1.0.79", features = ["derive"] }
 serde_json = "1.0.79"
-rocket_dyn_templates = { version = "0.1.0-rc.1", features = ["handlebars"] }
+rocket_dyn_templates = { version = "0.1", features = ["handlebars"] }
 redis = "0.20.1"
 log = "0.4.14"
 doc-comment = "0.3.3"
@@ -20,12 +20,18 @@ handlebars = "4.0.1"
 paste = "1.0.5"
 schemars = "^0.8.1"
 either = "1.6.1"
-okapi = "0.7.0-rc.1"
-rocket_okapi = { version="0.8.0-rc.1", features = ["swagger"] }
+okapi = "0.7"
+rocket_okapi = { version="0.8", features = ["swagger"] }
 hyper = { version = "0.14", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
 hyper-multipart-rfc7578 = "0.8"
 http = "0.2.8"
+rocket_prometheus = "0.10"
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"], default-features = false }
 
 [dev-dependencies]
 futures = "*"

@@ -93,6 +93,36 @@ pub async fn get_data_from_url(url: &str) -> Result<Box<Bytes>, hyper::Error> {
     Ok(Box::new(frozen))
 }
 
+/// Test stub — returns a fixed model_id so unit tests don't need a live
+/// file-service. Mirrors the behaviour of `create_results_file`.
+#[cfg(test)]
+pub async fn put_model_bytes(_bytes: Vec<u8>, _content_type: &str)
+    -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+{
+    Ok("200".to_string())
+}
+
+/// POST /api/files to allocate a new fileID, then PUT the raw bytes to
+/// /api/files/<fid>. Returns the fileID (= model_id on the submit form).
+#[cfg(not(test))]
+pub async fn put_model_bytes(bytes: Vec<u8>, content_type: &str)
+    -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+{
+    // Step 1 — create a new file slot (reuses the existing multipart helper).
+    let file_id = create_results_file().await?;
+    // Step 2 — upload the bytes to that slot.
+    let client = Client::new();
+    let url = format!("{}/api/files/{}", file_service_base(), file_id);
+    let req = Request::put(&url)
+        .header("Content-Type", content_type)
+        .body(hyper::Body::from(bytes))?;
+    let resp = client.request(req).await?;
+    if !resp.status().is_success() {
+        return Err(format!("file-service PUT {} -> {}", url, resp.status()).into());
+    }
+    Ok(file_id)
+}
+
 #[doc = "Function to get a URL from sogno-file-service using a file ID"]
 pub async fn convert_id_to_url(model_id: &str) -> Result<String, hyper::Error>{
     #[cfg(not(test))]

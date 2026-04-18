@@ -29,9 +29,12 @@ extern crate rocket;
 mod routes;
 mod file_service;
 mod amqp;
+mod auth;
+mod pg;
 #[cfg(not(test))] mod db;
 use rocket_dyn_templates::Template;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
+use rocket_prometheus::PrometheusMetrics;
 
 fn get_docs() -> SwaggerUIConfig {
     SwaggerUIConfig {
@@ -44,13 +47,21 @@ fn get_docs() -> SwaggerUIConfig {
 #[doc = "The main entry point for Rocket" ]
 async fn main() -> Result <(), rocket::Error> {
 
+    // Rocket 0.5 stable returns the launched Rocket<Ignite> on successful
+    // shutdown instead of (). Discard it to keep the main() signature.
+    // rocket_prometheus exposes /metrics with default HTTP histograms.
+    let prometheus = PrometheusMetrics::new();
     rocket::build()
         .register("/", catchers![routes::incomplete_form])
         .mount("/", routes::get_routes())
+        .mount("/", auth::get_routes())
         .mount("/swagger", make_swagger_ui(&get_docs()))
+        .mount("/metrics", prometheus.clone())
+        .attach(prometheus)
         .attach(Template::fairing())
         .launch()
         .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

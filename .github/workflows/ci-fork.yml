@@ -1,0 +1,27 @@
+# Fork CI — runs on pushes to every branch (not just PRs to main) so the
+# macOS-port / verify branches get green checks for free. Added in session 13
+# while the upstream build_test.yml (PR-to-main only) stays untouched so it
+# merges cleanly.
+name: ci-fork
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: Run unit tests
+        run: cargo test --release --verbose
+      - name: Cargo fmt (non-blocking)
+        run: cargo fmt --all -- --check
+        continue-on-error: true

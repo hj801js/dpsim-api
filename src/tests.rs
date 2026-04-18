@@ -13,6 +13,7 @@ fn rocket() -> rocket::Rocket<Build> {
     rocket::build()
         .register("/", catchers![incomplete_form])
         .mount("/", get_routes())
+        .mount("/", crate::auth::get_routes())
         .attach(Template::fairing())
 }
 
@@ -130,4 +131,76 @@ fn test_post_simulation() {
     });
     let received_json: Simulation = serde_json::from_str( reply.as_str() ).unwrap();
     assert_json_eq!(expected_simulation, received_json)
+}
+
+#[test]
+fn test_post_model_upload() {
+    // P4.2 regression — POST /models with raw XML body returns the file-service
+    // test stub's fixed model_id ("200" per file_service::put_model_bytes).
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let response = client
+        .post("/models")
+        .header(ContentType::XML)
+        .body("<cim><Node id=\"n1\"/></cim>")
+        .dispatch();
+    assert_eq!(response.status().code, 200);
+    let reply = response.into_string().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(body["model_id"], "200");
+    assert_eq!(body["bytes"], 26);
+}
+
+#[test]
+fn test_healthz() {
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let response = client.get("/healthz").dispatch();
+    assert_eq!(response.status().code, 200);
+    assert_eq!(response.into_string().unwrap(), "ok");
+}
+
+#[test]
+fn test_version() {
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let response = client.get("/version").dispatch();
+    assert_eq!(response.status().code, 200);
+    let body: serde_json::Value =
+        serde_json::from_str(&response.into_string().unwrap()).unwrap();
+    assert_eq!(body["name"], "dpsim-api");
+    assert!(body["version"].as_str().is_some());
+    assert!(body["git_sha"].as_str().is_some());
+}
+
+#[test]
+fn test_auth_signup_login_me() {
+    // P4.1 regression — full signup → login → /auth/me round trip with a JWT
+    // secret provided via env so issue_token succeeds. New user per test run.
+    std::env::set_var("DPSIM_JWT_SECRET", "rocket-test-secret");
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+
+    let email = format!("test-{}@dpsim.local", std::process::id());
+    let creds = json!({ "email": email, "password": "abcdefgh12345" });
+
+    let signup = client.post("/auth/signup").json(&creds).dispatch();
+    assert_eq!(signup.status().code, 200, "signup must 200");
+    let signup_body: serde_json::Value =
+        serde_json::from_str(&signup.into_string().unwrap()).unwrap();
+    let token = signup_body["token"].as_str().unwrap().to_owned();
+
+    let login = client.post("/auth/login").json(&creds).dispatch();
+    assert_eq!(login.status().code, 200, "login must 200");
+
+    let me = client
+        .get("/auth/me")
+        .header(rocket::http::Header::new(
+            "Authorization",
+            format!("Bearer {}", token),
+        ))
+        .dispatch();
+    assert_eq!(me.status().code, 200);
+    let me_body: serde_json::Value =
+        serde_json::from_str(&me.into_string().unwrap()).unwrap();
+    assert_eq!(me_body["email"], email);
+
+    let me_no_token = client.get("/auth/me").dispatch();
+    assert_eq!(me_no_token.status().code, 401, "no-token must 401");
 }
