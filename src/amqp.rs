@@ -108,15 +108,12 @@ pub async fn request_simulation(_simulation: &AMQPSimulation) -> Result<()> {
       },
       "load_profile" : load_profile,
       "parameters": {
+        "simulation_type": _simulation.simulation_type,
         "domain":          _simulation.domain,
         "solver":          _simulation.solver,
         "timestep":        _simulation.timestep,
         "finaltime":       _simulation.finaltime,
-        "results_file":    _simulation.results_file,
-        "executable": "SLEW_Shmem_CIGRE_MV_PowerFlow",
-        "name": "SLEW_Shmem_CIGRE_MV_PowerFlow",
-        "timestep": 0.1,
-        "duration": 20
+        "results_file":    _simulation.results_file
       }
     });
     let message = serde_json::to_vec(&message_as_jsonvalue).unwrap();

@@ -4,7 +4,9 @@ use redis::{Commands, RedisResult};
 use crate::routes::Simulation;
 
 fn get_connection() -> redis::RedisResult<redis::Connection> {
-    let client = redis::Client::open("redis://redis-master/")?;
+    let url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://redis-master/".into());
+    let client = redis::Client::open(url)?;
     client.get_connection()
 }
 
