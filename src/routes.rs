@@ -1,6 +1,5 @@
 use rocket::response::{self, Redirect, Responder, Response};
 use rocket::serde::json::{Json};
-use async_global_executor::block_on;
 use crate::db;
 use crate::amqp;
 use crate::amqp::AMQPSimulation;
@@ -444,9 +443,9 @@ pub async fn post_simulation(
                 .or_else(crate::telemetry::start_post_simulation_span);
             let traceparent      = span_ctx.as_ref()
                 .and_then(crate::telemetry::span_context_to_traceparent);
-            match block_on(amqp::request_simulation_with_traceparent(
+            match amqp::request_simulation_with_traceparent(
                 &amqp_sim, &simulation.trace_id, traceparent,
-            )) {
+            ).await {
                 Ok(()) => Ok(simulation),
                 Err(e) => Err(SimulationError {
                     err: format!("Could not publish to amqp server: {}", e),
@@ -533,12 +532,15 @@ pub async fn incomplete_form(form: &rocket::Request<'_>) -> String {
     format!("Incomplete form.{}", form)
 }
 
+/// ZIP local-file-header magic. Byte-for-byte identical to the worker's
+/// `body[:4] == b"PK\x03\x04"` sniff in `_resolve_uploaded_model` — both
+/// sides must agree, otherwise an upload that passes API validation gets
+/// rejected by the worker (or vice versa).
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+
 #[doc = "Returns the list of routes that we have defined"]
-/// ZIP magic bytes (PK\x03\x04). Matches session-12 worker sniffer so the two
-/// stay aligned — a byte sequence the worker would treat as a ZIP bundle
-/// shouldn't be rejected here for failing XML validation.
 fn looks_like_zip(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[..4] == [0x50, 0x4b, 0x03, 0x04]
+    bytes.len() >= 4 && bytes[..4] == ZIP_MAGIC
 }
 
 /// Validate an uploaded CIM XML body. Returns `Ok` for well-formed XML
