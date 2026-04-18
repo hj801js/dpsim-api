@@ -126,6 +126,26 @@ pub struct SimulationForm {
 }
 
 async fn parse_simulation_form(form: Json<SimulationForm>) -> Result<Json<Simulation>, SimulationError>{
+    // Sanity-check numeric bounds before allocating a simulation id so the
+    // caller gets a 400 instead of a row in redis + a queued job. The worker
+    // clamps these too (examples/service-stack/worker.py::clamp_params), but
+    // obviously-bad input should never reach the queue.
+    if form.timestep == 0 {
+        return Err(SimulationError {
+            err: "timestep (ms) must be > 0".into(),
+            http_status_code: Status::BadRequest,
+        });
+    }
+    if form.finaltime < form.timestep.saturating_mul(10) {
+        return Err(SimulationError {
+            err: format!(
+                "finaltime ({} ms) must be >= 10 * timestep ({} ms)",
+                form.finaltime, form.timestep,
+            ),
+            http_status_code: Status::BadRequest,
+        });
+    }
+
     let simulation_id = match db::get_new_simulation_id() {
         Ok(id) => id,
         Err(e) => return Err(SimulationError {
@@ -246,6 +266,15 @@ pub async fn get_root() -> Redirect {
     Redirect::to(uri!(get_api))
 }
 
+#[openapi(skip)]
+#[doc = "Liveness probe — returns 200 \"ok\" when the HTTP handler is reachable. \
+         Intended for Makefile/container readiness checks. Upgrade to a real \
+         readiness probe (redis + AMQP) when ops needs it."]
+#[get("/healthz")]
+pub async fn get_healthz() -> &'static str {
+    "ok"
+}
+
 #[doc = "Get the details for a simulation"]
 #[openapi]
 #[get("/simulation/<id>", format="application/json")]
@@ -357,5 +386,5 @@ pub async fn incomplete_form(form: &rocket::Request<'_>) -> String {
 
 #[doc = "Returns the list of routes that we have defined"]
 pub fn get_routes() -> Vec<rocket::Route>{
-    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_simulations, post_simulation, get_simulation_id]
+    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_simulations, post_simulation, get_simulation_id]
 }
