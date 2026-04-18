@@ -204,6 +204,26 @@ fn rate_limited(key: &str) -> bool {
     over
 }
 
+/// Normalize the email so `Foo@Bar.com` and `foo@bar.com` share a rate
+/// bucket. Trim whitespace and ASCII-lowercase — email addresses are
+/// case-insensitive per RFC 5321 §4.1.2.
+fn norm_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+/// Sweep rate-limit entries whose hits have all expired. Called after each
+/// insert so the map doesn't grow unbounded across distinct emails.
+fn sweep_rate_limits(now: u64) {
+    let cutoff = now.saturating_sub(RATE_WINDOW_SECS);
+    let mut guard = AUTH_HITS.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|_, hits| {
+            hits.retain(|t| *t > cutoff);
+            !hits.is_empty()
+        });
+    }
+}
+
 // -------------------------------------------------------------------------
 // Routes
 // -------------------------------------------------------------------------
@@ -222,38 +242,44 @@ pub struct TokenResponse {
 #[rocket_okapi::openapi(skip)]
 #[post("/auth/signup", format = "json", data = "<creds>")]
 pub async fn signup(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
-    if rate_limited(&format!("signup:{}", creds.email)) {
+    let email = norm_email(&creds.email);
+    if rate_limited(&format!("signup:{}", email)) {
+        sweep_rate_limits(now_secs());
         return Err(Status::TooManyRequests);
     }
+    sweep_rate_limits(now_secs());
     if creds.password.len() < 8 {
         return Err(Status::BadRequest);
     }
     let user_id = uuid_v4();
     let hash = hash_password(&creds.password).map_err(|_| Status::InternalServerError)?;
     with_users(|map| {
-        if map.contains_key(&creds.email) {
+        if map.contains_key(&email) {
             Err(Status::Conflict)
         } else {
-            map.insert(creds.email.clone(), User {
+            map.insert(email.clone(), User {
                 id:            user_id.clone(),
-                email:         creds.email.clone(),
+                email:         email.clone(),
                 password_hash: hash,
             });
             Ok(())
         }
     })?;
-    let token = issue_token(&user_id, &creds.email, 24)
+    let token = issue_token(&user_id, &email, 24)
         .ok_or(Status::ServiceUnavailable)?;
-    Ok(Json(TokenResponse { token, email: creds.email.clone() }))
+    Ok(Json(TokenResponse { token, email }))
 }
 
 #[rocket_okapi::openapi(skip)]
 #[post("/auth/login", format = "json", data = "<creds>")]
 pub async fn login(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
-    if rate_limited(&format!("login:{}", creds.email)) {
+    let email = norm_email(&creds.email);
+    if rate_limited(&format!("login:{}", email)) {
+        sweep_rate_limits(now_secs());
         return Err(Status::TooManyRequests);
     }
-    let user = with_users(|map| map.get(&creds.email).cloned())
+    sweep_rate_limits(now_secs());
+    let user = with_users(|map| map.get(&email).cloned())
         .ok_or(Status::Unauthorized)?;
     if !verify_password(&creds.password, &user.password_hash) {
         return Err(Status::Unauthorized);

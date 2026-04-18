@@ -338,7 +338,10 @@ pub async fn get_simulation_id(id: u64) -> SimulationResult {
             let data = file_service::get_data_from_url(&uri).await;
             let results: String = match data {
                 Ok(boxed_data) => {
-                    std::str::from_utf8(&boxed_data).unwrap().into()
+                    // Use from_utf8_lossy so a stray invalid byte in the CSV
+                    // doesn't panic the handler. dpsim CSV is ASCII in
+                    // practice; lossy conversion is a strictly-safer fallback.
+                    String::from_utf8_lossy(&boxed_data).into_owned()
                 },
                 Err(e) => return Err( SimulationError {
                                           err: format!("Could not read results from url. Results id:{} Error: {}", sim.results_id, e),

@@ -12,7 +12,30 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
-use crate::routes::{Simulation, SimulationSummary};
+use crate::routes::{DomainType, Simulation, SimulationSummary, SimulationType, SolverType};
+
+fn stype_str(t: SimulationType) -> &'static str {
+    match t {
+        SimulationType::Powerflow => "Powerflow",
+        SimulationType::Outage    => "Outage",
+    }
+}
+
+fn domain_str(d: DomainType) -> &'static str {
+    match d {
+        DomainType::SP  => "SP",
+        DomainType::DP  => "DP",
+        DomainType::EMT => "EMT",
+    }
+}
+
+fn solver_str(s: SolverType) -> &'static str {
+    match s {
+        SolverType::MNA => "MNA",
+        SolverType::DAE => "DAE",
+        SolverType::NRP => "NRP",
+    }
+}
 
 static POOL: OnceCell<Option<PgPool>> = OnceCell::const_new();
 
@@ -43,12 +66,9 @@ pub async fn insert_simulation(
     user_sub: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let Some(p) = pool().await else { return Ok(()) };
-    let st_str: String = serde_json::to_string(&sim.simulation_type)
-        .unwrap_or_default().trim_matches('"').to_owned();
-    let dom_str: String = serde_json::to_string(&sim.domain)
-        .unwrap_or_default().trim_matches('"').to_owned();
-    let sol_str: String = serde_json::to_string(&sim.solver)
-        .unwrap_or_default().trim_matches('"').to_owned();
+    let st_str  = stype_str(sim.simulation_type);
+    let dom_str = domain_str(sim.domain);
+    let sol_str = solver_str(sim.solver);
     // sub is a UUID string we generated in auth::signup — parse back to UUID
     // for the pg column. Best effort; None fills the column with NULL.
     let user_uuid = user_sub.and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
@@ -62,9 +82,9 @@ pub async fn insert_simulation(
     .bind(&sim.results_id)
     .bind(&sim.model_id)
     .bind(&sim.load_profile_id)
-    .bind(&st_str)
-    .bind(&dom_str)
-    .bind(&sol_str)
+    .bind(st_str)
+    .bind(dom_str)
+    .bind(sol_str)
     .bind(sim.timestep as i32)
     .bind(sim.finaltime as i32)
     .bind(user_uuid)
