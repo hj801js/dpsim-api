@@ -271,7 +271,7 @@ pub async fn signup(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Sta
     if creds.password.len() < 8 {
         return Err(Status::BadRequest);
     }
-    let user_id = uuid_v4();
+    let user_id = uuid::Uuid::new_v4().to_string();
     let hash = hash_password(&creds.password).map_err(|_| Status::InternalServerError)?;
     with_users(|map| {
         if map.contains_key(&email) {
@@ -320,18 +320,4 @@ pub async fn me(user: AuthedUser) -> Json<serde_json::Value> {
 
 pub fn get_routes() -> Vec<rocket::Route> {
     routes![signup, login, me]
-}
-
-// Tiny UUID-v4 — avoid adding the uuid crate just for this.
-fn uuid_v4() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    )
 }

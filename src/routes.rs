@@ -550,12 +550,18 @@ fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
-    // Empty upload → nothing to validate but worthless anyway.
     if bytes.is_empty() {
         return Err("empty body".into());
     }
+    // CIM XML is UTF-8 (required by IEC 61970-552). Reject non-UTF-8 here
+    // so we never feed a lossy conversion into the downstream worker.
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("invalid UTF-8 at byte {}: {}", e.valid_up_to(), e))?;
 
-    let mut reader = Reader::from_reader(bytes);
+    // `Reader::from_str` is the slice-backed reader — no external buf
+    // needed and events borrow directly from `text` instead of copying
+    // through a Vec on every read.
+    let mut reader = Reader::from_str(text);
     {
         let cfg = reader.config_mut();
         cfg.trim_text(true);
@@ -564,9 +570,8 @@ fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
     }
     let mut saw_root = false;
     let mut depth: i32 = 0;
-    let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Err(e) => return Err(format!("malformed XML at pos {}: {}", reader.buffer_position(), e)),
             Ok(Event::Eof) => break,
             // DOCTYPE processing instruction → entity expansion surface.
@@ -590,7 +595,6 @@ fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
             }
             _ => {}
         }
-        buf.clear();
     }
     if !saw_root {
         return Err("no XML elements found".into());
