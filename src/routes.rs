@@ -131,7 +131,13 @@ pub struct SimulationForm {
     /// remove before sim.run(). Leave empty / None for a baseline simulation.
     /// P3.4 outage MVP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outage_component:  Option<String>
+    pub outage_component:  Option<String>,
+    /// Optional — multiplier applied to every CIM EnergyConsumer P/Q before
+    /// sim.run(). 1.0 = baseline, 1.5 = heavier load, 0.5 = lighter. Worker
+    /// mutates the SV file so CIMReader sees the scaled values.
+    /// P3.3 load-profile MVP (scalar, not time-series).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_factor:       Option<f64>
 }
 
 async fn parse_simulation_form(
@@ -407,8 +413,9 @@ pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > 
         });
     }
     let user_sub = user.0.as_ref().map(|c| c.sub.clone());
-    // Pull the outage hint off the form before we move it into the parser.
+    // Pull the scenario hints off the form before we move it into the parser.
     let form_outage = form.outage_component.clone();
+    let form_load_factor = form.load_factor;
     match parse_simulation_form(form, user_sub.as_deref()).await {
         Ok(simulation) => {
             let model_id         = &simulation.model_id;
@@ -422,7 +429,7 @@ pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > 
                 load_profile_url = file_service::convert_id_to_url(load_profile_id).await?;
             }
             let outage           = form_outage.clone();
-            let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url, outage);
+            let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url, outage, form_load_factor);
             match block_on(amqp::request_simulation(&amqp_sim, &simulation.trace_id)) {
                 Ok(()) => Ok(simulation),
                 Err(e) => Err(SimulationError {

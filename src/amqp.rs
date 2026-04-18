@@ -77,7 +77,9 @@ pub struct AMQPSimulation {
     timestep:          u64,
     finaltime:         u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    outage_component:  Option<String>
+    outage_component:  Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_factor:       Option<f64>
 }
 
 impl AMQPSimulation {
@@ -86,6 +88,7 @@ impl AMQPSimulation {
         model_url: String,
         load_profile_url: String,
         outage_component: Option<String>,
+        load_factor: Option<f64>,
     ) -> AMQPSimulation {
         AMQPSimulation {
             error:            "".into(),
@@ -99,6 +102,7 @@ impl AMQPSimulation {
             timestep:         sim.timestep,
             finaltime:        sim.finaltime,
             outage_component: outage_component,
+            load_factor:      load_factor,
         }
     }
 }
@@ -135,7 +139,8 @@ pub async fn request_simulation(_simulation: &AMQPSimulation, trace_id: &str) ->
         "finaltime":       _simulation.finaltime,
         "results_file":    _simulation.results_file,
         "trace_id":        trace_id,
-        "outage_component": _simulation.outage_component
+        "outage_component": _simulation.outage_component,
+        "load_factor":     _simulation.load_factor
       }
     });
     let message = serde_json::to_vec(&message_as_jsonvalue).unwrap();

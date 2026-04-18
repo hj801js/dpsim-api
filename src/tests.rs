@@ -108,6 +108,7 @@ fn test_post_simulation() {
         timestep:        1,
         finaltime:       360,
         outage_component: None,
+        load_factor:      None,
     };
     let body = serde_json::to_string(&form).unwrap();
     let response = client.post("/simulation")
