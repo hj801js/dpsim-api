@@ -159,6 +159,53 @@ fn test_post_model_upload() {
 }
 
 #[test]
+fn test_post_model_rejects_malformed_xml() {
+    // C hardening — non-well-formed XML gets 400 before reaching file-service.
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let response = client
+        .post("/models")
+        .header(ContentType::XML)
+        .body("<cim><unclosed>")
+        .dispatch();
+    assert_eq!(response.status().code, 400);
+}
+
+#[test]
+fn test_post_model_rejects_doctype() {
+    // C hardening — DOCTYPE with entity declarations is the XXE / billion-
+    // laughs surface; reject unconditionally.
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    let bomb = r#"<?xml version="1.0"?>
+<!DOCTYPE lolz [
+  <!ENTITY lol "lol">
+  <!ENTITY lol2 "&lol;&lol;&lol;">
+]>
+<lolz>&lol2;</lolz>"#;
+    let response = client
+        .post("/models")
+        .header(ContentType::XML)
+        .body(bomb)
+        .dispatch();
+    assert_eq!(response.status().code, 400);
+}
+
+#[test]
+fn test_post_model_accepts_zip() {
+    // C hardening — ZIP bundles (PK\x03\x04) skip XML validation; the worker
+    // extracts and validates them on its end.
+    let client = Client::untracked(rocket()).expect("valid rocket instance");
+    // Minimal ZIP magic + random filler. The test stub returns "200"
+    // regardless of contents.
+    let zip_bytes: &[u8] = b"PK\x03\x04random bytes that would fail xml";
+    let response = client
+        .post("/models")
+        .header(ContentType::new("application", "zip"))
+        .body(zip_bytes)
+        .dispatch();
+    assert_eq!(response.status().code, 200);
+}
+
+#[test]
 fn test_healthz() {
     let client = Client::untracked(rocket()).expect("valid rocket instance");
     let response = client.get("/healthz").dispatch();

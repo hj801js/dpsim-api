@@ -494,6 +494,18 @@ pub async fn post_model(
     }
     let bytes_vec = bytes.into_inner();
     let len = bytes_vec.len();
+    // CIM XML validation — reject anything that isn't well-formed XML and
+    // anything with a DOCTYPE declaration (entity expansion / billion-laughs
+    // attack surface). ZIP bundles pass through unchecked; worker-side
+    // _resolve_uploaded_model will sniff and extract them.
+    if !looks_like_zip(&bytes_vec) {
+        if let Err(e) = validate_cim_xml(&bytes_vec) {
+            return Err(SimulationError {
+                err: format!("CIM validation failed: {}", e),
+                http_status_code: Status::BadRequest,
+            });
+        }
+    }
     // CIM XML is the only format the worker accepts today; hard-code the
     // content type to text/xml when forwarding to file-service.
     let model_id = file_service::put_model_bytes(bytes_vec, "application/xml")
@@ -519,6 +531,72 @@ pub async fn incomplete_form(form: &rocket::Request<'_>) -> String {
 }
 
 #[doc = "Returns the list of routes that we have defined"]
+/// ZIP magic bytes (PK\x03\x04). Matches session-12 worker sniffer so the two
+/// stay aligned — a byte sequence the worker would treat as a ZIP bundle
+/// shouldn't be rejected here for failing XML validation.
+fn looks_like_zip(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == [0x50, 0x4b, 0x03, 0x04]
+}
+
+/// Validate an uploaded CIM XML body. Returns `Ok` for well-formed XML
+/// without a DOCTYPE. DOCTYPE is rejected outright: CIMpp doesn't need it
+/// and leaving the door open invites XXE / billion-laughs.
+fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    // Empty upload → nothing to validate but worthless anyway.
+    if bytes.is_empty() {
+        return Err("empty body".into());
+    }
+
+    let mut reader = Reader::from_reader(bytes);
+    {
+        let cfg = reader.config_mut();
+        cfg.trim_text(true);
+        cfg.check_end_names = true;  // reject <open>...<open2></open2> without closing <open>
+        cfg.expand_empty_elements = false;
+    }
+    let mut saw_root = false;
+    let mut depth: i32 = 0;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(e) => return Err(format!("malformed XML at pos {}: {}", reader.buffer_position(), e)),
+            Ok(Event::Eof) => break,
+            // DOCTYPE processing instruction → entity expansion surface.
+            // quick-xml surfaces these as DocType events; reject any presence.
+            Ok(Event::DocType(dt)) => {
+                return Err(format!(
+                    "DOCTYPE declarations are not allowed (got {:?}); \
+                     CIM files shipped with dpsim never use them",
+                    std::str::from_utf8(dt.as_ref()).unwrap_or("<non-utf8>")
+                ));
+            }
+            Ok(Event::Start(_)) => {
+                saw_root = true;
+                depth += 1;
+            }
+            Ok(Event::End(_)) => {
+                depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                saw_root = true;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    if !saw_root {
+        return Err("no XML elements found".into());
+    }
+    if depth != 0 {
+        return Err(format!("unbalanced elements (depth={} at EOF)", depth));
+    }
+    Ok(())
+}
+
+
 pub fn get_routes() -> Vec<rocket::Route>{
     return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_version, get_simulations, post_simulation, post_model, get_simulation_id]
 }
