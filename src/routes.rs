@@ -33,7 +33,9 @@ pub struct Simulation {
     pub domain:            DomainType,
     pub solver:            SolverType,
     pub timestep:          u64,
-    pub finaltime:         u64
+    pub finaltime:         u64,
+    #[serde(default)]
+    pub trace_id:          String
 }
 
 impl fmt::Display for Simulation {
@@ -159,6 +161,14 @@ async fn parse_simulation_form(
                          })
     };
     let results_file     = file_service::create_results_file().await?;
+    // Short hex trace id — enough to correlate a UI submission with worker
+    // log lines without being a hard guarantee of uniqueness across history.
+    let trace_id = {
+        use rand::RngCore;
+        let mut b = [0u8; 6];
+        rand::thread_rng().fill_bytes(&mut b);
+        b.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+    };
     let simulation = Simulation {
         error:           "".to_string(),
         load_profile_id: form.load_profile_id.clone(),
@@ -170,7 +180,8 @@ async fn parse_simulation_form(
         domain:          form.domain,
         solver:          form.solver,
         timestep:        form.timestep,
-        finaltime:       form.finaltime
+        finaltime:       form.finaltime,
+        trace_id:        trace_id
     };
     match db::write_simulation(&simulation_id.to_string(), &simulation) {
         Ok(()) => {
@@ -404,7 +415,7 @@ pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > 
                 load_profile_url = file_service::convert_id_to_url(load_profile_id).await?;
             }
             let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url);
-            match block_on(amqp::request_simulation(&amqp_sim)) {
+            match block_on(amqp::request_simulation(&amqp_sim, &simulation.trace_id)) {
                 Ok(()) => Ok(simulation),
                 Err(e) => Err(SimulationError {
                     err: format!("Could not publish to amqp server: {}", e),

@@ -55,6 +55,7 @@ fn test_get_simulation_by_id() {
         solver:          SolverType::NRP,
         timestep:        1,
         finaltime:       360,
+        trace_id:        "".into(),
         results_data:    r#"{
   "data": {
     "fileID": "d297cb7c-b578-4da8-9d79-76432e8986e9",
@@ -128,8 +129,13 @@ fn test_post_simulation() {
         solver:            SolverType::NRP,
         timestep:          1,
         finaltime:         360,
+        trace_id:          "".into(),
     });
-    let received_json: Simulation = serde_json::from_str( reply.as_str() ).unwrap();
+    let mut received_json: Simulation = serde_json::from_str( reply.as_str() ).unwrap();
+    // Trace id is randomized per request — verify it's present then neutralise
+    // it so the equality check focuses on the rest of the payload.
+    assert!(!received_json.trace_id.is_empty(), "trace_id should be set");
+    received_json.trace_id = "".into();
     assert_json_eq!(expected_simulation, received_json)
 }
 

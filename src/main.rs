@@ -90,7 +90,8 @@ mod db {
                domain:          DomainType::SP,
                solver:          SolverType::NRP,
                timestep:        1,
-               finaltime:       360
+               finaltime:       360,
+               trace_id:        "".into()
         })
     }
 }

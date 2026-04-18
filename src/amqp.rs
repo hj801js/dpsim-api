@@ -14,12 +14,12 @@ use rocket::serde::json::{json, Json};
 use serde::{ Serialize, Deserialize };
 use schemars::JsonSchema;
 #[cfg(test)]
-pub async fn publish(bytes: Vec<u8>) -> Result<()> {
+pub async fn publish(bytes: Vec<u8>, _trace_id: &str) -> Result<()> {
     println!("AMQPSimulation: {:?}", bytes);
     Ok(())
 }
 #[cfg(not(test))]
-pub async fn publish(bytes: Vec<u8>) -> Result<()> {
+pub async fn publish(bytes: Vec<u8>, trace_id: &str) -> Result<()> {
     let addr = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rabbitmq:5672/%2f".into());
 
     let conn = Connection::connect(
@@ -41,13 +41,21 @@ pub async fn publish(bytes: Vec<u8>) -> Result<()> {
 
     info!("Declared queue {:?}", queue);
 
+    // Stamp the trace-id into AMQP headers so the worker can correlate its
+    // log lines + redis status with the originating HTTP request. P2.2.
+    let mut headers = FieldTable::default();
+    headers.insert("x-trace-id".into(), lapin::types::AMQPValue::LongString(
+        trace_id.to_string().into(),
+    ));
+    let props = BasicProperties::default().with_headers(headers);
+
     let confirm = channel_a
         .basic_publish(
             "",
             "dpsim-worker-queue",
             BasicPublishOptions::default(),
             bytes,
-            BasicProperties::default(),
+            props,
         )
         .await?
         .await?;
@@ -87,7 +95,7 @@ impl AMQPSimulation {
     }
 }
 
-pub async fn request_simulation(_simulation: &AMQPSimulation) -> Result<()> {
+pub async fn request_simulation(_simulation: &AMQPSimulation, trace_id: &str) -> Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -101,6 +109,9 @@ pub async fn request_simulation(_simulation: &AMQPSimulation) -> Result<()> {
         });
     }
 
+    // trace_id also goes into the body (alongside the AMQP header) so the
+    // worker can surface it into redis even if the header path gets lost
+    // (e.g. DLQ republish by broker).
     let message_as_jsonvalue = json!({
       "model" : {
         "type" : "url-list",
@@ -114,12 +125,13 @@ pub async fn request_simulation(_simulation: &AMQPSimulation) -> Result<()> {
         "solver":          _simulation.solver,
         "timestep":        _simulation.timestep,
         "finaltime":       _simulation.finaltime,
-        "results_file":    _simulation.results_file
+        "results_file":    _simulation.results_file,
+        "trace_id":        trace_id
       }
     });
     let message = serde_json::to_vec(&message_as_jsonvalue).unwrap();
 
-    publish(message).await?;
+    publish(message, trace_id).await?;
 
     Ok(())
 }
