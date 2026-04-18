@@ -29,6 +29,15 @@ RUN apt-get update \
 COPY --from=builder /usr/src/dpsim-api/target/release/dpsim-api /usr/bin/dpsim-api
 COPY --from=builder /usr/src/dpsim-api/templates/ /usr/bin/templates/
 COPY --from=builder /usr/src/dpsim-api/Rocket.toml /usr/bin/Rocket.toml
+
+# Non-root runtime user (docs/43 #10). The API only reads its baked-in
+# templates + Rocket.toml and opens :8000 — no filesystem writes needed,
+# and uploads are streamed straight to the file-service URL. Running as
+# root added zero capability and broadened the blast radius if a future
+# dependency ever had an RCE.
+RUN useradd --system --shell /usr/sbin/nologin --uid 10001 dpsim
+USER dpsim:dpsim
+
 WORKDIR /usr/bin
 EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=2s --retries=10 \
