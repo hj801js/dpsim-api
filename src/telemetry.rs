@@ -207,7 +207,7 @@ impl Fairing for TracingFairing {
         let slot = req.local_cache::<Mutex<RequestSpanSlot>, _>(|| {
             Mutex::new(RequestSpanSlot { span: None, ctx: None, started: Instant::now() })
         });
-        let mut guard = slot.lock().unwrap();
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut span) = guard.span.take() {
             span.set_attribute(KeyValue::new("http.status_code", resp.status().code as i64));
             span.set_attribute(KeyValue::new(

@@ -123,16 +123,35 @@ impl<'r> FromRequest<'r> for MaybeAuthedUser {
     }
 }
 
-// rocket_okapi needs these so guard-using handlers stay in the swagger schema.
-// We expose nothing — the guard only reads headers, never rejects the request
-// on its own, so from okapi's perspective it's transparent.
+// OpenAPI: advertise the bearer-token scheme so swagger's "Authorize" button
+// works and every endpoint guarded by these types shows a lock icon. Reuse a
+// single named scheme ("BearerAuth") across MaybeAuthedUser and AuthedUser —
+// OpenAPI 3 dedupes by name so the schema emits one definition.
+fn bearer_security() -> (String, okapi::openapi3::SecurityScheme, okapi::openapi3::SecurityRequirement) {
+    let scheme = okapi::openapi3::SecurityScheme {
+        description: Some(
+            "JWT returned by POST /auth/login. Supply as `Authorization: Bearer <token>`."
+                .into(),
+        ),
+        data: okapi::openapi3::SecuritySchemeData::Http {
+            scheme: "bearer".into(),
+            bearer_format: Some("JWT".into()),
+        },
+        extensions: Default::default(),
+    };
+    let mut req = okapi::openapi3::SecurityRequirement::new();
+    req.insert("BearerAuth".to_owned(), Vec::new());
+    ("BearerAuth".to_owned(), scheme, req)
+}
+
 impl<'r> OpenApiFromRequest<'r> for MaybeAuthedUser {
     fn from_request_input(
         _gen: &mut OpenApiGenerator,
         _name: String,
         _required: bool,
     ) -> rocket_okapi::Result<RequestHeaderInput> {
-        Ok(RequestHeaderInput::None)
+        let (name, scheme, req) = bearer_security();
+        Ok(RequestHeaderInput::Security(name, scheme, req))
     }
 }
 
@@ -142,7 +161,8 @@ impl<'r> OpenApiFromRequest<'r> for AuthedUser {
         _name: String,
         _required: bool,
     ) -> rocket_okapi::Result<RequestHeaderInput> {
-        Ok(RequestHeaderInput::None)
+        let (name, scheme, req) = bearer_security();
+        Ok(RequestHeaderInput::Security(name, scheme, req))
     }
 }
 
@@ -168,7 +188,7 @@ struct User {
 static USERS: Mutex<Option<HashMap<String, User>>> = Mutex::new(None);
 
 fn with_users<T>(f: impl FnOnce(&mut HashMap<String, User>) -> T) -> T {
-    let mut guard = USERS.lock().unwrap();
+    let mut guard = USERS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
@@ -195,7 +215,7 @@ fn now_secs() -> u64 {
 fn rate_limited(key: &str) -> bool {
     let now = now_secs();
     let cutoff = now.saturating_sub(RATE_WINDOW_SECS);
-    let mut guard = AUTH_HITS.lock().unwrap();
+    let mut guard = AUTH_HITS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     let hits = map.entry(key.to_owned()).or_default();
     hits.retain(|t| *t > cutoff);
@@ -215,7 +235,7 @@ fn norm_email(email: &str) -> String {
 /// insert so the map doesn't grow unbounded across distinct emails.
 fn sweep_rate_limits(now: u64) {
     let cutoff = now.saturating_sub(RATE_WINDOW_SECS);
-    let mut guard = AUTH_HITS.lock().unwrap();
+    let mut guard = AUTH_HITS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = guard.as_mut() {
         map.retain(|_, hits| {
             hits.retain(|t| *t > cutoff);
