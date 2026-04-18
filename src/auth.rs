@@ -174,6 +174,37 @@ fn with_users<T>(f: impl FnOnce(&mut HashMap<String, User>) -> T) -> T {
 }
 
 // -------------------------------------------------------------------------
+// Rate limiting — per-email sliding window on /auth/login and /auth/signup
+// so a misconfigured client or casual bruteforcer can't hammer argon2id.
+// In-memory; resets on process restart. Replace with redis INCR + EXPIRE if
+// we ever run more than one dpsim-api replica.
+// -------------------------------------------------------------------------
+const RATE_WINDOW_SECS: u64 = 60;
+const RATE_MAX_HITS:  usize = 5;
+
+static AUTH_HITS: Mutex<Option<HashMap<String, Vec<u64>>>> = Mutex::new(None);
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Returns true when `key` has exceeded RATE_MAX_HITS within the rolling
+/// RATE_WINDOW_SECS. Records the hit on the way out regardless — so a
+/// caller blocked at attempt 6 still extends the window with attempt 7.
+fn rate_limited(key: &str) -> bool {
+    let now = now_secs();
+    let cutoff = now.saturating_sub(RATE_WINDOW_SECS);
+    let mut guard = AUTH_HITS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let hits = map.entry(key.to_owned()).or_default();
+    hits.retain(|t| *t > cutoff);
+    let over = hits.len() >= RATE_MAX_HITS;
+    hits.push(now);
+    over
+}
+
+// -------------------------------------------------------------------------
 // Routes
 // -------------------------------------------------------------------------
 #[derive(Deserialize, JsonSchema)]
@@ -191,6 +222,9 @@ pub struct TokenResponse {
 #[rocket_okapi::openapi(skip)]
 #[post("/auth/signup", format = "json", data = "<creds>")]
 pub async fn signup(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
+    if rate_limited(&format!("signup:{}", creds.email)) {
+        return Err(Status::TooManyRequests);
+    }
     if creds.password.len() < 8 {
         return Err(Status::BadRequest);
     }
@@ -216,6 +250,9 @@ pub async fn signup(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Sta
 #[rocket_okapi::openapi(skip)]
 #[post("/auth/login", format = "json", data = "<creds>")]
 pub async fn login(creds: Json<Credentials>) -> Result<Json<TokenResponse>, Status> {
+    if rate_limited(&format!("login:{}", creds.email)) {
+        return Err(Status::TooManyRequests);
+    }
     let user = with_users(|map| map.get(&creds.email).cloned())
         .ok_or(Status::Unauthorized)?;
     if !verify_password(&creds.password, &user.password_hash) {
