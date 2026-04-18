@@ -430,7 +430,16 @@ pub async fn post_simulation(user: MaybeAuthedUser, form: Json<SimulationForm > 
             }
             let outage           = form_outage.clone();
             let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url, outage, form_load_factor);
-            match block_on(amqp::request_simulation(&amqp_sim, &simulation.trace_id)) {
+            // P2.2c — if OTel is initialized, mint a real span context here
+            // so the AMQP traceparent header carries the dpsim-api trace id
+            // instead of our padded short id. Worker's extract will see the
+            // API span as the parent of dpsim-worker.on_msg.
+            let span_ctx         = crate::telemetry::start_post_simulation_span();
+            let traceparent      = span_ctx.as_ref()
+                .and_then(crate::telemetry::span_context_to_traceparent);
+            match block_on(amqp::request_simulation_with_traceparent(
+                &amqp_sim, &simulation.trace_id, traceparent,
+            )) {
                 Ok(()) => Ok(simulation),
                 Err(e) => Err(SimulationError {
                     err: format!("Could not publish to amqp server: {}", e),

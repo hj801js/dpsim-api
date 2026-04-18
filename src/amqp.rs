@@ -43,7 +43,19 @@ fn _build_w3c_traceparent(trace_id: &str) -> String {
     format!("00-{}-{}-01", trace_hex, span_hex)
 }
 #[cfg(not(test))]
+pub async fn publish_with_traceparent(
+    bytes: Vec<u8>, trace_id: &str, traceparent: Option<String>,
+) -> Result<()> {
+    publish_inner(bytes, trace_id, traceparent).await
+}
+
+#[cfg(not(test))]
 pub async fn publish(bytes: Vec<u8>, trace_id: &str) -> Result<()> {
+    publish_inner(bytes, trace_id, None).await
+}
+
+#[cfg(not(test))]
+async fn publish_inner(bytes: Vec<u8>, trace_id: &str, override_traceparent: Option<String>) -> Result<()> {
     let addr = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rabbitmq:5672/%2f".into());
 
     let conn = Connection::connect(
@@ -74,7 +86,10 @@ pub async fn publish(bytes: Vec<u8>, trace_id: &str) -> Result<()> {
     // root span it creates becomes a child of this publish in the same
     // Jaeger trace — turning HTTP → AMQP → CIM build → sim.run into one
     // end-to-end waterfall instead of two disconnected trees.
-    let w3c_traceparent = _build_w3c_traceparent(trace_id);
+    // Prefer the real OTel-SDK-minted traceparent when the caller has one;
+    // fall back to our padded short-trace-id when OTel isn't initialized.
+    let w3c_traceparent = override_traceparent
+        .unwrap_or_else(|| _build_w3c_traceparent(trace_id));
     let mut headers = FieldTable::default();
     headers.insert("x-trace-id".into(), lapin::types::AMQPValue::LongString(
         trace_id.to_string().into(),
@@ -143,6 +158,12 @@ impl AMQPSimulation {
 }
 
 pub async fn request_simulation(_simulation: &AMQPSimulation, trace_id: &str) -> Result<()> {
+    request_simulation_with_traceparent(_simulation, trace_id, None).await
+}
+
+pub async fn request_simulation_with_traceparent(
+    _simulation: &AMQPSimulation, trace_id: &str, traceparent: Option<String>,
+) -> Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -180,7 +201,10 @@ pub async fn request_simulation(_simulation: &AMQPSimulation, trace_id: &str) ->
     });
     let message = serde_json::to_vec(&message_as_jsonvalue).unwrap();
 
-    publish(message, trace_id).await?;
+    #[cfg(not(test))]
+    publish_inner(message, trace_id, traceparent).await?;
+    #[cfg(test)]
+    { let _ = traceparent; publish(message, trace_id).await?; }
 
     Ok(())
 }

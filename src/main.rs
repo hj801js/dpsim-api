@@ -31,6 +31,7 @@ mod file_service;
 mod amqp;
 mod auth;
 mod pg;
+mod telemetry;
 #[cfg(not(test))] mod db;
 use rocket_dyn_templates::Template;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
@@ -46,6 +47,11 @@ fn get_docs() -> SwaggerUIConfig {
 #[rocket::main]
 #[doc = "The main entry point for Rocket" ]
 async fn main() -> Result <(), rocket::Error> {
+
+    if telemetry::init() {
+        eprintln!("[otel] exporting spans to {}",
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default());
+    }
 
     // Rocket 0.5 stable returns the launched Rocket<Ignite> on successful
     // shutdown instead of (). Discard it to keep the main() signature.
