@@ -54,33 +54,44 @@ fn cim_data_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/Users/hk/DPsim_hk/dpsim/build/_deps/cim-data-src"))
 }
 
-fn bundle_glob(model_id: &str) -> Option<PathBuf> {
-    let root = cim_data_root();
-    match model_id {
-        "wscc9"    => Some(root.join("WSCC-09").join("WSCC-09")),
-        "ieee14"   => Some(root.join("IEEE-14")),
-        "ieee39"   => Some(root.join("IEEE-39")),
-        "cigre_mv" => Some(
-            root.join("CIGRE_MV")
-                .join("NEPLAN")
-                .join("CIGRE_MV_no_tapchanger_noLoad1_LeftFeeder_With_LoadFlow_Results")
-        ),
-        // Matpower single-file cases live in the Matpower_cases dir; the
-        // generic `collect_xmls` would slurp all 5 cases if we returned
-        // the dir root, so this branch uses `single_file` instead.
-        _ => matpower_single(&root, model_id),
-    }
+fn bundles_manifest() -> PathBuf {
+    std::env::var("DPSIM_BUNDLES_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/Users/hk/DPsim_hk/ops/cim-bundles.json"))
 }
 
-fn matpower_single(root: &Path, model_id: &str) -> Option<PathBuf> {
-    let file = match model_id {
-        "matpower_case9"   => "case9.xml",
-        "matpower_case14"  => "case14.xml",
-        "matpower_case300" => "case300.xml",
-        _ => return None,
-    };
-    let path = root.join("Matpower_cases").join(file);
-    if path.exists() { Some(path) } else { None }
+#[derive(serde::Deserialize)]
+struct BundleEntry {
+    id:   String,
+    path: String,
+    // `kind` ("dir" | "file") lives in the manifest for the Python
+    // consumers; Rust detects via Path::is_file() at read time so we
+    // don't need to deserialize it.
+}
+
+#[derive(serde::Deserialize)]
+struct BundlesManifest {
+    #[serde(default)]
+    bundles: Vec<BundleEntry>,
+}
+
+/// Resolve a model_id to its on-disk source by consulting
+/// `ops/cim-bundles.json` (the same manifest worker.py and
+/// gen-model-catalog.py read). Returns None when the id isn't listed or
+/// the file/dir is missing. Manifest is read lazily and not cached —
+/// bundle config changes rarely and the file is tiny.
+fn bundle_glob(model_id: &str) -> Option<PathBuf> {
+    let root = cim_data_root();
+    let manifest_path = bundles_manifest();
+    let text = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest: BundlesManifest = serde_json::from_str(&text).ok()?;
+    for entry in &manifest.bundles {
+        if entry.id != model_id { continue; }
+        let full = root.join(&entry.path);
+        if !full.exists() { return None; }
+        return Some(full);
+    }
+    None
 }
 
 fn collect_xmls(dir: &Path) -> Vec<PathBuf> {
