@@ -616,5 +616,5 @@ fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
 
 
 pub fn get_routes() -> Vec<rocket::Route>{
-    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_version, get_simulations, post_simulation, post_model, get_simulation_id]
+    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_version, get_simulations, post_simulation, post_model, get_simulation_id, crate::topology::get_topology]
 }

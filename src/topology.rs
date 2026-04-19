@@ -17,6 +17,7 @@
 use rocket::serde::Serialize;
 use rocket::serde::json::Json;
 use rocket::http::Status;
+use rocket_okapi::openapi;
 use schemars::JsonSchema;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -313,6 +314,7 @@ fn topo_cache() -> &'static Mutex<LruCache<String, Arc<TopologyResponse>>> {
     })
 }
 
+#[openapi]
 #[get("/topology/<model_id>")]
 pub async fn get_topology(
     user: crate::auth::MaybeAuthedUser,
@@ -425,6 +427,6 @@ fn parse_cim_bundle_from_strs(xmls: &[String]) -> Result<TopologyResponse, Strin
     parse_cim_events(&as_refs)
 }
 
-pub fn get_routes() -> Vec<rocket::Route> {
-    routes![get_topology]
-}
+// Intentionally no `get_routes()` here — the topology handler is included
+// in the main `routes::get_routes()` openapi_get_routes! list so there's
+// only one /openapi.json emitter in the app.

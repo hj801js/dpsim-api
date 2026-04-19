@@ -63,7 +63,6 @@ async fn main() -> Result <(), rocket::Error> {
         .register("/", catchers![routes::incomplete_form])
         .mount("/", routes::get_routes())
         .mount("/", auth::get_routes())
-        .mount("/", topology::get_routes())
         .mount("/swagger", make_swagger_ui(&get_docs()))
         .mount("/metrics", prometheus.clone())
         .attach(prometheus)
