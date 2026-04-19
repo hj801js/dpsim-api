@@ -289,8 +289,33 @@ fn parse_cim_events(xmls: &[&str]) -> Result<TopologyResponse, String> {
 // ---------------------------------------------------------------------------
 // Route
 // ---------------------------------------------------------------------------
+/// Accept only characters we know appear in real model ids — baked bundle
+/// names (`wscc9`, `ieee14`, `ieee39`, `cigre_mv`, `matpower_case300`) and
+/// the hex ids file-service assigns to uploads. Everything else — slashes,
+/// dots, percent-encoded traversal — gets rejected before any filesystem
+/// or file-service call. Rocket already url-decodes the path segment so
+/// this runs on the decoded string.
+fn is_safe_model_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 #[get("/topology/<model_id>")]
-pub async fn get_topology(model_id: String) -> Result<Json<TopologyResponse>, Status> {
+pub async fn get_topology(
+    user: crate::auth::MaybeAuthedUser,
+    model_id: String,
+) -> Result<Json<TopologyResponse>, Status> {
+    if !is_safe_model_id(&model_id) {
+        return Err(Status::BadRequest);
+    }
+    // Guard behind auth when DPSIM_AUTH_REQUIRED is on — uploaded models
+    // carry private CIM data and shouldn't be readable by anonymous probes.
+    // Baked bundles could be public but we gate everything for simplicity;
+    // the dev mode (flag off) stays wide open.
+    if crate::auth::auth_required() && user.0.is_none() {
+        return Err(Status::Unauthorized);
+    }
     // Baked bundle path — worker.CIM_BUNDLES mirror.
     if let Some(path) = bundle_glob(&model_id) {
         // Handle both dir-of-xmls and single-file forms.
