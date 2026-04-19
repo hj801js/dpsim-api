@@ -44,11 +44,6 @@ pub struct TopologyResponse {
 }
 
 
-#[derive(Serialize, JsonSchema)]
-pub struct TopologyError {
-    pub err: String,
-}
-
 // ---------------------------------------------------------------------------
 // Bundle registry — mirrors dpsim/examples/service-stack/worker.py
 // ---------------------------------------------------------------------------

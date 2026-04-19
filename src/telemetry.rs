@@ -5,7 +5,7 @@
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is unset so `make up` stays portable.
 
 use opentelemetry::{global, KeyValue};
-use opentelemetry::trace::{SpanBuilder, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer};
+use opentelemetry::trace::{SpanBuilder, SpanContext, SpanId, SpanKind, TraceFlags, TraceId, TraceState, Tracer};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
 use rocket::fairing::{Fairing, Info, Kind};
@@ -37,7 +37,7 @@ pub fn init() -> bool {
                 .http()
                 .with_endpoint(traces_url),
         )
-        .with_trace_config(sdktrace::config().with_resource(Resource::new(vec![
+        .with_trace_config(sdktrace::Config::default().with_resource(Resource::new(vec![
             KeyValue::new("service.name", "dpsim-api"),
         ])))
         .install_batch(runtime::Tokio);

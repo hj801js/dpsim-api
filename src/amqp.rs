@@ -42,7 +42,12 @@ fn _build_w3c_traceparent(trace_id: &str) -> String {
     let span_hex: String = span.iter().map(|b| format!("{:02x}", b)).collect();
     format!("00-{}-{}-01", trace_hex, span_hex)
 }
+// Retained for ad-hoc AMQP publishes from future callers (worker control
+// plane, DLQ replay CLI). Currently only request_simulation_with_traceparent
+// is hit by the HTTP handler, so these emit dead_code warnings without the
+// allow attribute.
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub async fn publish_with_traceparent(
     bytes: Vec<u8>, trace_id: &str, traceparent: Option<String>,
 ) -> Result<()> {
@@ -50,6 +55,7 @@ pub async fn publish_with_traceparent(
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub async fn publish(bytes: Vec<u8>, trace_id: &str) -> Result<()> {
     publish_inner(bytes, trace_id, None).await
 }
@@ -161,6 +167,7 @@ impl AMQPSimulation {
     }
 }
 
+#[allow(dead_code)]
 pub async fn request_simulation(_simulation: &AMQPSimulation, trace_id: &str) -> Result<()> {
     request_simulation_with_traceparent(_simulation, trace_id, None).await
 }

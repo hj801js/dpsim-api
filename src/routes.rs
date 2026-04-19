@@ -91,15 +91,6 @@ impl Default for SimulationType {
     }
 }
 
-#[doc = "String conversion for the various Simulation types"]
-impl SimulationType {
-    fn to_string(&self) -> String {
-        match &*self {
-            SimulationType::Powerflow => "Powerflow".to_owned(),
-            SimulationType::Outage    => "Outage".to_owned()
-        }
-    }
-}
 
 /// # Form for submitting a new Simulation
 ///
