@@ -136,7 +136,21 @@ pub struct SimulationForm {
     /// mutates the SV file so CIMReader sees the scaled values.
     /// P3.3 load-profile MVP (scalar, not time-series).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_factor:       Option<f64>
+    pub load_factor:       Option<f64>,
+    /// Optional — time-series variant of load_factor. Each point is
+    /// [t_sec, factor]; worker picks an effective scalar (max for
+    /// Powerflow stress-tests, linearly-interpolated end-of-run value
+    /// for DP/EMT) and applies it with _apply_load_factor. Per-step
+    /// time-stepping isn't exposed by dpsim's Python API so this is a
+    /// pragmatic approximation — see docs/44 §X for the scope note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_factor_series: Option<Vec<LoadFactorPoint>>,
+}
+
+#[derive(FromForm, Debug, Serialize, Deserialize, JsonSchema, Clone)]
+pub struct LoadFactorPoint {
+    pub t_sec:  f64,
+    pub factor: f64,
 }
 
 async fn parse_simulation_form(
@@ -422,6 +436,7 @@ pub async fn post_simulation(
     // Pull the scenario hints off the form before we move it into the parser.
     let form_outage = form.outage_component.clone();
     let form_load_factor = form.load_factor;
+    let form_load_series = form.load_factor_series.clone();
     match parse_simulation_form(form, user_sub.as_deref()).await {
         Ok(simulation) => {
             let model_id         = &simulation.model_id;
@@ -435,7 +450,10 @@ pub async fn post_simulation(
                 load_profile_url = file_service::convert_id_to_url(load_profile_id).await?;
             }
             let outage           = form_outage.clone();
-            let amqp_sim         = AMQPSimulation::from_simulation(&simulation, model_url, load_profile_url, outage, form_load_factor);
+            let amqp_sim         = AMQPSimulation::from_simulation(
+                &simulation, model_url, load_profile_url, outage,
+                form_load_factor, form_load_series,
+            );
             // P2.2d — reuse the fairing's request span context so AMQP
             // publishes land in the same trace Jaeger already knows about.
             // Falls back to a fresh span when OTel isn't initialised.

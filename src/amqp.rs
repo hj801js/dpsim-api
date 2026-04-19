@@ -127,9 +127,11 @@ pub struct AMQPSimulation {
     timestep:          u64,
     finaltime:         u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    outage_component:  Option<String>,
+    outage_component:   Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    load_factor:       Option<f64>
+    load_factor:        Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_factor_series: Option<Vec<crate::routes::LoadFactorPoint>>,
 }
 
 impl AMQPSimulation {
@@ -139,20 +141,22 @@ impl AMQPSimulation {
         load_profile_url: String,
         outage_component: Option<String>,
         load_factor: Option<f64>,
+        load_factor_series: Option<Vec<crate::routes::LoadFactorPoint>>,
     ) -> AMQPSimulation {
         AMQPSimulation {
-            error:            "".into(),
-            load_profile_url: load_profile_url,
-            model_url:        model_url,
-            simulation_id:    sim.simulation_id,
-            simulation_type:  sim.simulation_type,
-            results_file:     sim.results_id.clone(),
-            domain:           sim.domain,
-            solver:           sim.solver,
-            timestep:         sim.timestep,
-            finaltime:        sim.finaltime,
-            outage_component: outage_component,
-            load_factor:      load_factor,
+            error:              "".into(),
+            load_profile_url:   load_profile_url,
+            model_url:          model_url,
+            simulation_id:      sim.simulation_id,
+            simulation_type:    sim.simulation_type,
+            results_file:       sim.results_id.clone(),
+            domain:             sim.domain,
+            solver:             sim.solver,
+            timestep:           sim.timestep,
+            finaltime:          sim.finaltime,
+            outage_component:   outage_component,
+            load_factor:        load_factor,
+            load_factor_series: load_factor_series,
         }
     }
 }
@@ -195,8 +199,9 @@ pub async fn request_simulation_with_traceparent(
         "finaltime":       _simulation.finaltime,
         "results_file":    _simulation.results_file,
         "trace_id":        trace_id,
-        "outage_component": _simulation.outage_component,
-        "load_factor":     _simulation.load_factor
+        "outage_component":   _simulation.outage_component,
+        "load_factor":        _simulation.load_factor,
+        "load_factor_series": _simulation.load_factor_series
       }
     });
     let message = serde_json::to_vec(&message_as_jsonvalue).unwrap();

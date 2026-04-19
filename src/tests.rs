@@ -107,8 +107,9 @@ fn test_post_simulation() {
         solver:          SolverType::NRP,
         timestep:        1,
         finaltime:       360,
-        outage_component: None,
-        load_factor:      None,
+        outage_component:   None,
+        load_factor:        None,
+        load_factor_series: None,
     };
     let body = serde_json::to_string(&form).unwrap();
     let response = client.post("/simulation")
