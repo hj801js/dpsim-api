@@ -19,12 +19,15 @@ use rocket::serde::json::Json;
 use rocket::http::Status;
 use schemars::JsonSchema;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use lru::LruCache;
 
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema, Clone)]
 pub struct TopologyBranch {
     pub name: String,
     pub bus_from: String,
@@ -33,12 +36,13 @@ pub struct TopologyBranch {
     pub kind: String,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema, Clone)]
 pub struct TopologyResponse {
     pub model_id: String,
     pub buses: Vec<String>,
     pub branches: Vec<TopologyBranch>,
 }
+
 
 #[derive(Serialize, JsonSchema)]
 pub struct TopologyError {
@@ -301,6 +305,19 @@ fn is_safe_model_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+// Topology response cache. Baked bundles are fixed XML on disk so their
+// parsed form never changes for the life of the process; uploaded models
+// are effectively immutable once file-service stores them (the worker
+// cache pins them by hash). 64 entries × ~100 KB/parsed-300-bus → ~6 MB
+// max — trivial. LRU evicts least-recently-queried uploads when the
+// workspace grows.
+fn topo_cache() -> &'static Mutex<LruCache<String, Arc<TopologyResponse>>> {
+    static CACHE: OnceLock<Mutex<LruCache<String, Arc<TopologyResponse>>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(NonZeroUsize::new(64).expect("positive")))
+    })
+}
+
 #[get("/topology/<model_id>")]
 pub async fn get_topology(
     user: crate::auth::MaybeAuthedUser,
@@ -316,6 +333,12 @@ pub async fn get_topology(
     if crate::auth::auth_required() && user.0.is_none() {
         return Err(Status::Unauthorized);
     }
+
+    // Cache hit? Promote + return a clone — responses are shared via Arc
+    // so clone is cheap. The Mutex is only held during LRU bookkeeping.
+    if let Some(hit) = topo_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&model_id).cloned() {
+        return Ok(Json((*hit).clone()));
+    }
     // Baked bundle path — worker.CIM_BUNDLES mirror.
     if let Some(path) = bundle_glob(&model_id) {
         // Handle both dir-of-xmls and single-file forms.
@@ -329,8 +352,12 @@ pub async fn get_topology(
                 eprintln!("[topology] parse {}: {}", model_id, e);
                 Status::InternalServerError
             })?;
-            resp.model_id = model_id;
-            return Ok(Json(resp));
+            resp.model_id = model_id.clone();
+            let arc = Arc::new(resp);
+            topo_cache().lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(model_id, Arc::clone(&arc));
+            return Ok(Json((*arc).clone()));
         }
     }
 
@@ -343,8 +370,12 @@ pub async fn get_topology(
                 eprintln!("[topology] parse uploaded {}: {}", model_id, e);
                 Status::InternalServerError
             })?;
-            resp.model_id = model_id;
-            Ok(Json(resp))
+            resp.model_id = model_id.clone();
+            let arc = Arc::new(resp);
+            topo_cache().lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(model_id, Arc::clone(&arc));
+            Ok(Json((*arc).clone()))
         }
         Ok(None) => Err(Status::NotFound),
         Err(e) => {
