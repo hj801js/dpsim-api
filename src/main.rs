@@ -32,6 +32,7 @@ mod amqp;
 mod auth;
 mod pg;
 mod telemetry;
+mod topology;
 #[cfg(not(test))] mod db;
 use rocket_dyn_templates::Template;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
@@ -62,6 +63,7 @@ async fn main() -> Result <(), rocket::Error> {
         .register("/", catchers![routes::incomplete_form])
         .mount("/", routes::get_routes())
         .mount("/", auth::get_routes())
+        .mount("/", topology::get_routes())
         .mount("/swagger", make_swagger_ui(&get_docs()))
         .mount("/metrics", prometheus.clone())
         .attach(prometheus)
