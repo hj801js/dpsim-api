@@ -1,7 +1,7 @@
 use rocket::local::blocking::Client;
 use rocket::Build;
 use serde::{Deserialize, Serialize};
-use crate::routes::{Simulation, SimulationArray, SimulationSummary, SimulationType, DomainType, SolverType, get_routes, incomplete_form};
+use crate::routes::{Simulation, SimulationArray, SimulationSummary, SimulationType, DomainType, SolverType, EngineType, get_routes, incomplete_form};
 use rocket::http::ContentType;
 use serde_json::json;
 use assert_json_diff::assert_json_eq;
@@ -66,6 +66,7 @@ fn test_get_simulation_by_id() {
 "#.to_string(),
         simulation_id:   1,
         simulation_type: SimulationType::Powerflow,
+        engine:          EngineType::Dpsim,
     };
     assert_json_eq!(received_json, expected_json)
 }
@@ -110,6 +111,7 @@ fn test_post_simulation() {
         outage_component:   None,
         load_factor:        None,
         load_factor_series: None,
+        engine:             EngineType::Dpsim,
     };
     let body = serde_json::to_string(&form).unwrap();
     let response = client.post("/simulation")
@@ -133,6 +135,7 @@ fn test_post_simulation() {
         timestep:          1,
         finaltime:         360,
         trace_id:          "".into(),
+        engine:            EngineType::Dpsim,
     });
     let mut received_json: Simulation = serde_json::from_str( reply.as_str() ).unwrap();
     // Trace id is randomized per request — verify it's present then neutralise

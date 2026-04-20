@@ -34,7 +34,9 @@ pub struct Simulation {
     pub timestep:          u64,
     pub finaltime:         u64,
     #[serde(default)]
-    pub trace_id:          String
+    pub trace_id:          String,
+    #[serde(default)]
+    pub engine:            EngineType,
 }
 
 impl fmt::Display for Simulation {
@@ -83,6 +85,26 @@ pub enum SolverType {
     MNA,
     DAE,
     NRP
+}
+
+#[doc = "Simulation engine selection (Phase 4 dual-engine UX).
+
+dpsim      — native DP/EMT/SP simulator (default, backward compatible).
+pandapower — CIM → pp.runpp() steady-state only, much faster for PF.
+both       — runs pandapower first (quick reference) then dpsim; UI can
+             diff the two CSVs."]
+#[derive(JsonSchema, FromFormField, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EngineType {
+    #[serde(rename = "dpsim")]
+    Dpsim,
+    #[serde(rename = "pandapower")]
+    Pandapower,
+    #[serde(rename = "both")]
+    Both,
+}
+
+impl Default for EngineType {
+    fn default() -> Self { EngineType::Dpsim }
 }
 
 impl Default for SimulationType {
@@ -136,6 +158,13 @@ pub struct SimulationForm {
     /// pragmatic approximation — see docs/44 §X for the scope note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_factor_series: Option<Vec<LoadFactorPoint>>,
+    /// Simulation engine (Phase 4). dpsim is backward-compatible default.
+    /// `pandapower` runs pp.runpp() via the PISA adapter; `both` runs
+    /// pp first then dpsim so the UI can compare the two. The worker
+    /// dispatches on `parameters.engine` in the AMQP payload.
+    #[serde(default)]
+    #[field(default = EngineType::Dpsim)]
+    pub engine: EngineType,
 }
 
 #[derive(FromForm, Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -196,7 +225,8 @@ async fn parse_simulation_form(
         solver:          form.solver,
         timestep:        form.timestep,
         finaltime:       form.finaltime,
-        trace_id:        trace_id
+        trace_id:        trace_id,
+        engine:          form.engine,
     };
     match db::write_simulation(&simulation_id.to_string(), &simulation) {
         Ok(()) => {
@@ -452,14 +482,37 @@ pub async fn post_simulation(
                 .or_else(crate::telemetry::start_post_simulation_span);
             let traceparent      = span_ctx.as_ref()
                 .and_then(crate::telemetry::span_context_to_traceparent);
+            let actor = user_sub.as_deref()
+                .map(|s| format!("user:{}", s))
+                .unwrap_or_else(|| "anon".into());
+            let target = format!("sim:{}", simulation.simulation_id);
+            let trace_id = simulation.trace_id.clone();
             match amqp::request_simulation_with_traceparent(
                 &amqp_sim, &simulation.trace_id, traceparent,
             ).await {
-                Ok(()) => Ok(simulation),
-                Err(e) => Err(SimulationError {
-                    err: format!("Could not publish to amqp server: {}", e),
-                    http_status_code: Status::BadGateway
-                })
+                Ok(()) => {
+                    crate::pg::audit(
+                        &actor, "sim.submit", Some(&target), "success",
+                        Some(&trace_id), None,
+                        Some(serde_json::json!({
+                            "model_id": simulation.model_id,
+                            "engine": simulation.engine,
+                            "domain": simulation.domain,
+                        })),
+                    ).await;
+                    Ok(simulation)
+                },
+                Err(e) => {
+                    crate::pg::audit(
+                        &actor, "sim.submit", Some(&target), "failure",
+                        Some(&trace_id), None,
+                        Some(serde_json::json!({ "error": format!("{}", e) })),
+                    ).await;
+                    Err(SimulationError {
+                        err: format!("Could not publish to amqp server: {}", e),
+                        http_status_code: Status::BadGateway
+                    })
+                }
             }
         },
         Err(e) => Err(e)

@@ -202,3 +202,38 @@ pub async fn list_recent(
             .collect(),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Audit log (Stage B1.3). Best-effort insert so audit failures never break
+// the primary request. Retention is handled by ops/audit_retention.sh.
+// ---------------------------------------------------------------------------
+
+pub async fn audit(
+    actor: &str,
+    event: &str,
+    target: Option<&str>,
+    outcome: &str,
+    trace_id: Option<&str>,
+    ip: Option<&str>,
+    details: Option<serde_json::Value>,
+) {
+    let Some(p) = pool().await else { return };
+    let res = sqlx::query(
+        "INSERT INTO audit_log (actor, event, target, outcome, trace_id, ip, details)
+         VALUES ($1, $2, $3, $4, $5, $6::INET, $7)",
+    )
+    .bind(actor)
+    .bind(event)
+    .bind(target)
+    .bind(outcome)
+    .bind(trace_id)
+    .bind(ip)
+    .bind(details)
+    .execute(&p)
+    .await;
+    if let Err(e) = res {
+        // Never propagate — audit is advisory. Log to stderr so Loki
+        // picks it up and an oncall alert can fire if audit stops flowing.
+        eprintln!("[audit] insert failed event={} actor={}: {}", event, actor, e);
+    }
+}

@@ -9,7 +9,7 @@ use log::info;
 use lapin::{
     Result,
 };
-use crate::routes::{Simulation, SimulationType, DomainType, SolverType};
+use crate::routes::{Simulation, SimulationType, DomainType, SolverType, EngineType};
 use rocket::serde::json::{json, Json};
 use serde::{ Serialize, Deserialize };
 use schemars::JsonSchema;
@@ -130,6 +130,7 @@ pub struct AMQPSimulation {
     results_file:      String,
     domain:            DomainType,
     solver:            SolverType,
+    engine:            EngineType,
     timestep:          u64,
     finaltime:         u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +159,7 @@ impl AMQPSimulation {
             results_file:       sim.results_id.clone(),
             domain:             sim.domain,
             solver:             sim.solver,
+            engine:             sim.engine,
             timestep:           sim.timestep,
             finaltime:          sim.finaltime,
             outage_component:   outage_component,
@@ -202,6 +204,7 @@ pub async fn request_simulation_with_traceparent(
         "simulation_type": _simulation.simulation_type,
         "domain":          _simulation.domain,
         "solver":          _simulation.solver,
+        "engine":          _simulation.engine,
         "timestep":        _simulation.timestep,
         "finaltime":       _simulation.finaltime,
         "results_file":    _simulation.results_file,

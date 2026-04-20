@@ -77,7 +77,7 @@ async fn main() -> Result <(), rocket::Error> {
 mod db {
     use redis::RedisResult;
     use crate::routes::{Simulation, SimulationType};
-    use crate::routes::{DomainType, SolverType};
+    use crate::routes::{DomainType, SolverType, EngineType};
     pub fn get_number_of_simulations() -> RedisResult<u64> {
         Ok(10)
     }
@@ -89,6 +89,8 @@ mod db {
     }
     pub fn revoke_token_sig(_sig: &str, _ttl_secs: u64) -> bool { false }
     pub fn is_token_sig_revoked(_sig: &str) -> bool { false }
+    /// Stub: redis unreachable in tests, so caller falls back to in-memory.
+    pub fn rate_limit_hit(_bucket: &str, _window_secs: u64) -> Option<u64> { None }
     pub fn read_simulation(_key: u64) -> redis::RedisResult<Simulation> {
         Ok(Simulation {
                error:           "".to_owned(),
@@ -102,7 +104,8 @@ mod db {
                solver:          SolverType::NRP,
                timestep:        1,
                finaltime:       360,
-               trace_id:        "".into()
+               trace_id:        "".into(),
+               engine:          EngineType::Dpsim,
         })
     }
 }

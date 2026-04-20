@@ -55,6 +55,39 @@ pub fn is_token_sig_revoked(sig: &str) -> bool {
     conn.exists(key).unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Atomic rate limit (Stage B1.5). INCR + EXPIRE executed as one Lua script
+// so concurrent callers can't see an intermediate state where the counter
+// exists without a TTL (which would never expire). Returns the count after
+// increment, or None when redis is unreachable.
+//
+// Callers treat None as "redis down → fall back to the in-memory limiter"
+// so the request path stays alive through a transient redis outage.
+//
+// The script returns the new counter value:
+//   redis.call('INCR', KEYS[1])
+//   if result == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+//   return result
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_LUA: &str = r#"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"#;
+
+pub fn rate_limit_hit(bucket: &str, window_secs: u64) -> Option<u64> {
+    let mut conn = get_connection().ok()?;
+    let key = format!("rl:{}", bucket);
+    let script = redis::Script::new(RATE_LIMIT_LUA);
+    script
+        .key(&key)
+        .arg(window_secs as usize)
+        .invoke::<u64>(&mut conn)
+        .ok()
+}
+
 #[doc = "Function for reading a Simulation from a Redis DB"]
 pub fn read_simulation(key: u64) -> Result<Simulation, RedisError> {
     let mut conn = get_connection()?;

@@ -58,7 +58,19 @@ pub struct Claims {
 }
 
 fn secret() -> Option<String> {
-    std::env::var("DPSIM_JWT_SECRET").ok()
+    // Stage B1.4: prefer `_FILE` indirection (Docker secrets mount
+    // `/run/secrets/<name>`) over the plain env var.
+    if let Ok(path) = std::env::var("DPSIM_JWT_SECRET_FILE") {
+        if !path.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+    }
+    std::env::var("DPSIM_JWT_SECRET").ok().filter(|s| !s.is_empty())
 }
 
 pub fn issue_token(user_id: &str, email: &str, ttl_hours: i64) -> Option<String> {
@@ -285,7 +297,15 @@ fn now_secs() -> u64 {
 /// Returns true when `key` has exceeded RATE_MAX_HITS within the rolling
 /// RATE_WINDOW_SECS. Records the hit on the way out regardless — so a
 /// caller blocked at attempt 6 still extends the window with attempt 7.
+///
+/// Stage B1.5: prefer the Redis Lua-atomic counter when redis is
+/// reachable (so multi-replica dpsim-api deployments share a bucket).
+/// Falls back to the in-memory limiter on redis failure.
 fn rate_limited(key: &str) -> bool {
+    if let Some(count) = crate::db::rate_limit_hit(key, RATE_WINDOW_SECS) {
+        // count is AFTER increment, so `>` rather than `>=`.
+        return count > RATE_MAX_HITS as u64;
+    }
     let now = now_secs();
     let cutoff = now.saturating_sub(RATE_WINDOW_SECS);
     let mut guard = AUTH_HITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,13 +427,23 @@ pub async fn signup(
 ) -> Result<Json<TokenResponse>, Status> {
     let email = norm_email(&creds.email);
     rate_limit_signup_or_login("signup", &email, &ip)?;
+    let ip_str = ip.0.map(|a| a.to_string());
     if creds.password.len() < 8 {
+        crate::pg::audit(
+            "anon", "auth.signup", Some(&email), "failure",
+            None, ip_str.as_deref(),
+            Some(serde_json::json!({ "reason": "password_too_short" }))
+        ).await;
         return Err(Status::BadRequest);
     }
     let hash = hash_password(&creds.password).map_err(|_| Status::InternalServerError)?;
     let user = create_user(&email, hash).await?;
     let token = issue_token(&user.id, &user.email, 24)
         .ok_or(Status::ServiceUnavailable)?;
+    crate::pg::audit(
+        &format!("user:{}", user.id), "auth.signup", Some(&user.email),
+        "success", None, ip_str.as_deref(), None,
+    ).await;
     Ok(Json(TokenResponse { token, email: user.email }))
 }
 
@@ -425,12 +455,32 @@ pub async fn login(
 ) -> Result<Json<TokenResponse>, Status> {
     let email = norm_email(&creds.email);
     rate_limit_signup_or_login("login", &email, &ip)?;
-    let user = find_user(&email).await.ok_or(Status::Unauthorized)?;
+    let ip_str = ip.0.map(|a| a.to_string());
+    let user = match find_user(&email).await {
+        Some(u) => u,
+        None => {
+            crate::pg::audit(
+                "anon", "auth.login", Some(&email), "failure",
+                None, ip_str.as_deref(),
+                Some(serde_json::json!({ "reason": "unknown_email" })),
+            ).await;
+            return Err(Status::Unauthorized);
+        }
+    };
     if !verify_password(&creds.password, &user.password_hash) {
+        crate::pg::audit(
+            &format!("user:{}", user.id), "auth.login", Some(&user.email),
+            "failure", None, ip_str.as_deref(),
+            Some(serde_json::json!({ "reason": "bad_password" })),
+        ).await;
         return Err(Status::Unauthorized);
     }
     let token = issue_token(&user.id, &user.email, 24)
         .ok_or(Status::ServiceUnavailable)?;
+    crate::pg::audit(
+        &format!("user:{}", user.id), "auth.login", Some(&user.email),
+        "success", None, ip_str.as_deref(), None,
+    ).await;
     Ok(Json(TokenResponse { token, email: user.email }))
 }
 
@@ -456,6 +506,10 @@ pub async fn logout(user: AuthedUser, bearer: BearerToken) -> Json<serde_json::V
         let ttl = ((user.0.exp as i64) - now).max(1) as u64;
         crate::db::revoke_token_sig(sig, ttl);
     }
+    crate::pg::audit(
+        &format!("user:{}", user.0.sub), "auth.logout", Some(&user.0.email),
+        "success", None, None, None,
+    ).await;
     Json(serde_json::json!({ "ok": true }))
 }
 
