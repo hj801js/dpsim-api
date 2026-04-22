@@ -68,6 +68,7 @@ async fn main() -> Result <(), rocket::Error> {
         .attach(prometheus)
         .attach(Template::fairing())
         .attach(telemetry::TracingFairing)
+        .attach(telemetry::RequestIdFairing)
         .launch()
         .await
         .map(|_| ())
@@ -93,6 +94,9 @@ mod db {
     pub fn rate_limit_hit(_bucket: &str, _window_secs: u64) -> Option<u64> { None }
     pub fn mark_sim_canceled(_sim_id: u64) -> bool { true }
     pub fn is_sim_canceled(_sim_id: u64) -> bool { false }
+    pub fn write_refresh_token(_t: &str, _u: &str, _e: &str, _ttl: u64) -> bool { true }
+    pub fn read_refresh_token(_t: &str) -> Option<(String, String)> { None }
+    pub fn revoke_refresh_token(_t: &str) -> bool { true }
     pub fn read_simulation(_key: u64) -> redis::RedisResult<Simulation> {
         Ok(Simulation {
                error:           "".to_owned(),

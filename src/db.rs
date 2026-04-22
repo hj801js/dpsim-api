@@ -94,6 +94,51 @@ pub fn is_sim_canceled(sim_id: u64) -> bool {
     conn.exists(key).unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Refresh token store (v1.2.4). Stateless access tokens (JWT, 1h) remain
+// but each login also issues a long-lived refresh token (random 32-byte
+// hex, 30d) that dpsim-api persists in redis so we can invalidate it at
+// logout and prevent reuse after rotation.
+//
+// Key: `auth:refresh:<token>` → JSON {user_id, email, exp}. TTL matches
+// the exp so redis cleans itself up.
+// ---------------------------------------------------------------------------
+pub fn write_refresh_token(
+    token: &str,
+    user_id: &str,
+    email: &str,
+    ttl_secs: u64,
+) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("auth:refresh:{}", token);
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) + ttl_secs;
+    let v = serde_json::json!({
+        "user_id": user_id,
+        "email":   email,
+        "exp":     exp,
+    }).to_string();
+    conn.set_ex::<_, _, ()>(key, v, ttl_secs as usize).is_ok()
+}
+
+pub fn read_refresh_token(token: &str) -> Option<(String, String)> {
+    let mut conn = get_connection().ok()?;
+    let key = format!("auth:refresh:{}", token);
+    let raw: String = conn.get(&key).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let user_id = v.get("user_id")?.as_str()?.to_string();
+    let email   = v.get("email")?.as_str()?.to_string();
+    Some((user_id, email))
+}
+
+pub fn revoke_refresh_token(token: &str) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("auth:refresh:{}", token);
+    conn.del::<_, u64>(key).map(|n| n > 0).unwrap_or(false)
+}
+
 pub fn rate_limit_hit(bucket: &str, window_secs: u64) -> Option<u64> {
     let mut conn = get_connection().ok()?;
     let key = format!("rl:{}", bucket);

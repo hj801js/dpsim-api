@@ -224,3 +224,59 @@ impl Fairing for TracingFairing {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// v1.2.5 — X-Request-ID fairing.
+//
+// Every response gets an `X-Request-ID` header so clients can cite the id
+// in support tickets. The id comes from (in order of preference):
+//   1. An inbound `X-Request-ID` header (client-supplied; passed through)
+//   2. The current OTel trace's 32-hex trace id (when SDK_PROVIDER is set)
+//   3. A random 16-byte hex fallback
+//
+// Independent of TracingFairing so X-Request-ID works even when OTel is
+// unconfigured (local dev with no Jaeger). Ordering doesn't matter — both
+// fairings run on Request/Response events.
+// ---------------------------------------------------------------------------
+pub struct RequestIdFairing;
+
+/// Cached per-request id so on_request + on_response see the same value.
+struct RequestIdSlot(String);
+
+#[rocket::async_trait]
+impl Fairing for RequestIdFairing {
+    fn info(&self) -> Info {
+        Info { name: "x-request-id", kind: Kind::Request | Kind::Response }
+    }
+
+    async fn on_request(&self, req: &mut Request<'_>, _: &mut Data<'_>) {
+        let incoming = req.headers().get_one("X-Request-ID").map(str::to_owned);
+        let id = incoming.unwrap_or_else(|| {
+            // Prefer the current trace id when OTel is live so the
+            // X-Request-ID the client sees is greppable in Jaeger.
+            let ctx_id = req
+                .local_cache::<Mutex<RequestSpanSlot>, _>(|| {
+                    Mutex::new(RequestSpanSlot {
+                        span: None, ctx: None, started: Instant::now(),
+                    })
+                })
+                .lock()
+                .ok()
+                .and_then(|g| g.ctx.as_ref().map(|c| c.trace_id().to_string()));
+            ctx_id.unwrap_or_else(|| {
+                use rand::RngCore;
+                let mut b = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut b);
+                b.iter().map(|x| format!("{:02x}", x)).collect()
+            })
+        });
+        req.local_cache(|| RequestIdSlot(id));
+    }
+
+    async fn on_response<'r>(&self, req: &'r Request<'_>, resp: &mut Response<'r>) {
+        let slot = req.local_cache::<RequestIdSlot, _>(|| RequestIdSlot(String::new()));
+        if !slot.0.is_empty() {
+            resp.set_raw_header("X-Request-ID", slot.0.clone());
+        }
+    }
+}

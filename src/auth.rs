@@ -392,6 +392,46 @@ pub struct Credentials {
 pub struct TokenResponse {
     pub token: String,
     pub email: String,
+    /// v1.2.4 — opaque 32-byte hex string. Use it with POST /auth/refresh
+    /// to mint a new access token without re-authenticating. Lives 30 days.
+    /// Null when the server failed to persist the token to redis (e.g.
+    /// redis unreachable) — existing clients ignore the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// v1.2.4 — access-token TTL in seconds. Echoes issue_token's
+    /// `ttl_hours * 3600` so clients can schedule refreshes. Nullable
+    /// for back-compat with the pre-v1.2.4 TokenResponse shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+}
+
+/// Access token lifetime for this build. 24h is deliberately long — clients
+/// that implement /auth/refresh can still rotate frequently, and clients
+/// that don't keep working for a day. Shorten to 1h once UI refresh
+/// adoption is confirmed (tracked in v1.3).
+const ACCESS_TTL_HOURS: i64 = 24;
+/// Refresh token lifetime. Matches a typical "long session" window; users
+/// who don't interact for a month get bounced back through /auth/login.
+const REFRESH_TTL_SECS: u64 = 30 * 24 * 3600;
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+/// Mint a fresh 32-byte hex refresh token and persist it in redis under
+/// `auth:refresh:<token>` with the refresh TTL. Returns None when redis
+/// is unreachable — callers should proceed with just the access token.
+fn mint_refresh_token(user_id: &str, email: &str) -> Option<String> {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    if crate::db::write_refresh_token(&token, user_id, email, REFRESH_TTL_SECS) {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 /// Rate-limit a request on two keys: the normalized email AND the client IP.
@@ -480,13 +520,19 @@ pub async fn signup(
     }
     let hash = hash_password(&creds.password).map_err(|_| Status::InternalServerError)?;
     let user = create_user(&email, hash).await?;
-    let token = issue_token(&user.id, &user.email, 24)
+    let token = issue_token(&user.id, &user.email, ACCESS_TTL_HOURS)
         .ok_or(Status::ServiceUnavailable)?;
+    let refresh_token = mint_refresh_token(&user.id, &user.email);
     crate::pg::audit(
         &format!("user:{}", user.id), "auth.signup", Some(&user.email),
         "success", None, ip_str.as_deref(), None,
     ).await;
-    Ok(Json(TokenResponse { token, email: user.email }))
+    Ok(Json(TokenResponse {
+        token,
+        email: user.email,
+        refresh_token,
+        expires_in: Some((ACCESS_TTL_HOURS * 3600) as u64),
+    }))
 }
 
 #[rocket_okapi::openapi(skip)]
@@ -517,13 +563,19 @@ pub async fn login(
         ).await;
         return Err(Status::Unauthorized);
     }
-    let token = issue_token(&user.id, &user.email, 24)
+    let token = issue_token(&user.id, &user.email, ACCESS_TTL_HOURS)
         .ok_or(Status::ServiceUnavailable)?;
+    let refresh_token = mint_refresh_token(&user.id, &user.email);
     crate::pg::audit(
         &format!("user:{}", user.id), "auth.login", Some(&user.email),
         "success", None, ip_str.as_deref(), None,
     ).await;
-    Ok(Json(TokenResponse { token, email: user.email }))
+    Ok(Json(TokenResponse {
+        token,
+        email: user.email,
+        refresh_token,
+        expires_in: Some((ACCESS_TTL_HOURS * 3600) as u64),
+    }))
 }
 
 #[rocket_okapi::openapi(skip)]
@@ -541,12 +593,22 @@ pub async fn me(user: AuthedUser) -> Json<serde_json::Value> {
 /// lifetime. Subsequent requests with the same token see the revocation
 /// entry and get 401 from the AuthedUser guard.
 #[rocket_okapi::openapi(skip)]
-#[post("/auth/logout")]
-pub async fn logout(user: AuthedUser, bearer: BearerToken) -> Json<serde_json::Value> {
+#[post("/auth/logout", data = "<body>")]
+pub async fn logout(
+    user: AuthedUser,
+    bearer: BearerToken,
+    body: Option<Json<RefreshRequest>>,
+) -> Json<serde_json::Value> {
     if let Some(sig) = token_sig_suffix(&bearer.0) {
         let now = Utc::now().timestamp();
         let ttl = ((user.0.exp as i64) - now).max(1) as u64;
         crate::db::revoke_token_sig(sig, ttl);
+    }
+    // v1.2.4 — if the caller also supplies their refresh token, revoke
+    // it so it can't be used to mint new access tokens. Optional so
+    // pre-v1.2.4 clients that call /auth/logout without a body still work.
+    if let Some(Json(rr)) = body {
+        crate::db::revoke_refresh_token(&rr.refresh_token);
     }
     crate::pg::audit(
         &format!("user:{}", user.0.sub), "auth.logout", Some(&user.0.email),
@@ -555,6 +617,54 @@ pub async fn logout(user: AuthedUser, bearer: BearerToken) -> Json<serde_json::V
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// Exchange a refresh token for a fresh access token. Rotates the refresh
+/// token — the old one is revoked so a stolen refresh can only be used
+/// once before the legitimate user's next call invalidates it.
+///
+/// 401 when the refresh token is unknown / expired / already-used.
+/// 503 when redis is unreachable (can't read the store).
+#[rocket_okapi::openapi(skip)]
+#[post("/auth/refresh", format = "json", data = "<body>")]
+pub async fn refresh(
+    ip: ClientIp,
+    body: Json<RefreshRequest>,
+) -> Result<Json<TokenResponse>, Status> {
+    // Rate-limit the refresh path on the same per-IP bucket as login so a
+    // stolen refresh can't be brute-forced by a flood. Email is unknown
+    // until we look up the token, so we only key by IP here.
+    if let Some(addr) = ip.0 {
+        if rate_limited(&format!("refresh:ip:{}", addr)) {
+            return Err(Status::TooManyRequests);
+        }
+    }
+
+    let (user_id, email) = match crate::db::read_refresh_token(&body.refresh_token) {
+        Some(pair) => pair,
+        None => return Err(Status::Unauthorized),
+    };
+
+    // Rotate: revoke the presented refresh token immediately. Replay of
+    // the same refresh_token after this point returns 401.
+    crate::db::revoke_refresh_token(&body.refresh_token);
+
+    let token = issue_token(&user_id, &email, ACCESS_TTL_HOURS)
+        .ok_or(Status::ServiceUnavailable)?;
+    let new_refresh = mint_refresh_token(&user_id, &email);
+
+    let ip_str = ip.0.map(|a| a.to_string());
+    crate::pg::audit(
+        &format!("user:{}", user_id), "auth.refresh", Some(&email),
+        "success", None, ip_str.as_deref(), None,
+    ).await;
+
+    Ok(Json(TokenResponse {
+        token,
+        email,
+        refresh_token: new_refresh,
+        expires_in: Some((ACCESS_TTL_HOURS * 3600) as u64),
+    }))
+}
+
 pub fn get_routes() -> Vec<rocket::Route> {
-    routes![signup, login, me, logout]
+    routes![signup, login, me, logout, refresh]
 }
