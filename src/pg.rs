@@ -154,53 +154,82 @@ pub async fn get_user_by_email(
     Ok(row.map(|(uuid, em, hash)| (uuid.to_string(), em, hash)))
 }
 
-/// Return the N most recent simulations from PG, optionally scoped to a user.
-/// None when PG disabled.
+/// Return `limit` simulations starting at `offset`, scoped to a user if
+/// supplied. Returns (rows, total_count). None when PG disabled.
 pub async fn list_recent(
     limit: i64,
+    offset: i64,
     user_sub: Option<&str>,
-) -> Option<Vec<SimulationSummary>> {
+) -> Option<(Vec<SimulationSummary>, i64)> {
     let p = pool().await?;
-    let rows: Vec<(i64, String, String)> = match user_sub
-        .and_then(|s| sqlx::types::Uuid::parse_str(s).ok())
-    {
-        Some(uid) => sqlx::query_as(
-            "SELECT simulation_id, model_id, simulation_type
-               FROM simulations
-              WHERE user_id = $2
-              ORDER BY created_at DESC
-              LIMIT $1",
-        )
-        .bind(limit)
-        .bind(uid)
-        .fetch_all(&p)
-        .await
-        .ok()?,
-        None => sqlx::query_as(
-            "SELECT simulation_id, model_id, simulation_type
-               FROM simulations
-              WHERE user_id IS NULL
-              ORDER BY created_at DESC
-              LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&p)
-        .await
-        .ok()?,
+    let uid_opt = user_sub.and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
+
+    let (rows, total): (Vec<(i64, String, String)>, i64) = match uid_opt {
+        Some(uid) => {
+            let rows = sqlx::query_as(
+                "SELECT simulation_id, model_id, simulation_type
+                   FROM simulations
+                  WHERE user_id = $3
+                  ORDER BY created_at DESC
+                  LIMIT $1 OFFSET $2",
+            )
+            .bind(limit).bind(offset).bind(uid)
+            .fetch_all(&p).await.ok()?;
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM simulations WHERE user_id = $1",
+            )
+            .bind(uid).fetch_one(&p).await.ok()?;
+            (rows, total)
+        }
+        None => {
+            let rows = sqlx::query_as(
+                "SELECT simulation_id, model_id, simulation_type
+                   FROM simulations
+                  WHERE user_id IS NULL
+                  ORDER BY created_at DESC
+                  LIMIT $1 OFFSET $2",
+            )
+            .bind(limit).bind(offset)
+            .fetch_all(&p).await.ok()?;
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM simulations WHERE user_id IS NULL",
+            )
+            .fetch_one(&p).await.ok()?;
+            (rows, total)
+        }
     };
-    Some(
+
+    Some((
         rows.into_iter()
             .map(|(sid, mid, stype)| SimulationSummary {
                 simulation_id: sid as u64,
                 model_id:      mid,
-                // Loose conversion back — PG stores the serde enum as text.
                 simulation_type: match stype.as_str() {
                     "Outage" => crate::routes::SimulationType::Outage,
                     _        => crate::routes::SimulationType::Powerflow,
                 },
             })
             .collect(),
+        total,
+    ))
+}
+
+/// Mark a simulation canceled in PG (v1.1.3). Best-effort; the real source
+/// of truth for cancelation is the redis `sim:<id>:canceled` flag that the
+/// worker consults — this PG write just keeps GET /simulation/<id> in sync
+/// without waiting for the worker to process its next dequeue.
+pub async fn mark_canceled(sim_id: u64) -> Result<(), sqlx::Error> {
+    let Some(p) = pool().await else { return Ok(()) };
+    sqlx::query(
+        "UPDATE simulations
+            SET status = 'canceled', completed_at = now()
+          WHERE simulation_id = $1
+            AND status IN ('queued', 'running')",
     )
+    .bind(sim_id as i64)
+    .execute(&p)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

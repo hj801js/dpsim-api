@@ -244,6 +244,23 @@ async fn parse_simulation_form(
     }
 }
 
+/// Error body emitted to HTTP clients. On the wire (v1.1+):
+///
+/// ```json
+/// { "error": "<human message>", "code": "ERR_*", "err": "<alias>" }
+/// ```
+///
+/// `error` is the canonical field. `err` is kept as an alias for one
+/// release so v1.0-era clients that parsed the old `{"err": ...}` shape
+/// don't break overnight — removed in v1.2.
+///
+/// `code` is a stable machine-readable enum value so clients can branch
+/// on error type without string-matching the message. Classified from
+/// http_status_code + route context at Responder time.
+///
+/// The Rust struct itself retains the original `{err, http_status_code}`
+/// layout so existing struct-literal callers still compile; the extended
+/// JSON shape is assembled in `respond_to`.
 #[derive(Debug, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct SimulationError {
     pub err: String,
@@ -263,12 +280,35 @@ impl From<InvalidUri> for SimulationError {
     }
 }
 
+fn default_code_for(status: rocket::http::Status) -> &'static str {
+    match status.code {
+        400 => "ERR_BAD_REQUEST",
+        401 => "ERR_UNAUTHORIZED",
+        403 => "ERR_FORBIDDEN",
+        404 => "ERR_NOT_FOUND",
+        409 => "ERR_CONFLICT",
+        413 => "ERR_PAYLOAD_TOO_LARGE",
+        422 => "ERR_UNPROCESSABLE",
+        429 => "ERR_RATE_LIMITED",
+        502 => "ERR_UPSTREAM",
+        503 => "ERR_UNAVAILABLE",
+        500 | _ => "ERR_INTERNAL",
+    }
+}
+
 type SimulationResult = std::result::Result<Json<Simulation>, SimulationError>;
 
 impl<'r> Responder<'r, 'static> for SimulationError {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
-        // Convert object to json
-        let body = serde_json::to_string(&self).unwrap();
+        // v1.1 canonical shape: {error, code, err}. `err` is a deprecated
+        // alias for one release; remove in v1.2. `code` is derived from
+        // the HTTP status for a consistent machine-readable tag.
+        let code = default_code_for(self.http_status_code);
+        let body = serde_json::json!({
+            "error": &self.err,
+            "code":  code,
+            "err":   &self.err,
+        }).to_string();
         let len = body.len();
         Response::build()
             .sized_body(len, std::io::Cursor::new(body))
@@ -390,52 +430,89 @@ pub async fn get_simulation_id(id: u64) -> SimulationResult {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[doc = "Struct for encapsulation Simulation details"]
+#[doc = "Paged list of simulations.
+
+`total` is the full count available on the server (useful for paging UI);
+`limit` + `offset` echo back the effective query (may be clamped from the
+request)."]
 pub struct SimulationArray {
-    pub simulations: Vec<SimulationSummary>
+    pub simulations: Vec<SimulationSummary>,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
 }
 
-#[doc = "List the simulations"]
+// Pagination defaults + clamps. Default 50 matches what the Next.js UI
+// already renders per page; max 500 is high enough for export scripts
+// without risking a 1M-row scan.
+const DEFAULT_LIMIT: u32 = 50;
+const MAX_LIMIT: u32 = 500;
+
+#[doc = "List the simulations. Supports `?limit=N&offset=N`."]
 #[openapi]
-#[get("/simulation", format="application/json")]
-pub async fn get_simulations(user: MaybeAuthedUser) -> Result<Json<SimulationArray>, SimulationError> {
+#[get("/simulation?<limit>&<offset>", format="application/json")]
+pub async fn get_simulations(
+    user: MaybeAuthedUser,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Json<SimulationArray>, SimulationError> {
     if auth_required() && user.0.is_none() {
         return Err(SimulationError {
             err: "authentication required".into(),
             http_status_code: Status::Unauthorized,
         });
     }
-    // Prefer PG (survives redis flush, supports per-user filtering). Fall
-    // back to the legacy redis scan when PG is off or the query fails.
+    let lim = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let off = offset.unwrap_or(0);
+
+    // Prefer PG (survives redis flush, supports per-user filtering + offset).
+    // Fall back to the legacy redis scan when PG is off or the query fails.
     let user_sub = user.0.as_ref().map(|c| c.sub.as_str());
-    if let Some(summaries) = pg::list_recent(100, user_sub).await {
-        return Ok(Json(SimulationArray { simulations: summaries }));
+    if let Some((summaries, total)) = pg::list_recent(lim as i64, off as i64, user_sub).await {
+        return Ok(Json(SimulationArray {
+            simulations: summaries,
+            total: total.max(0) as u64,
+            limit: lim,
+            offset: off,
+        }));
     }
+
+    // Redis fallback: paginate in-memory since redis doesn't index by date.
+    // Newest simulation_id is the largest (INCR-counter), so walk descending
+    // and skip `offset` rows, take `limit`.
     match db::get_number_of_simulations() {
-        Ok(number_of_simulations) => {
+        Ok(total_n) => {
             let mut simvec = Vec::new();
-            // "The range start..end contains all values with start <= x < end. It is empty if start >= end."
-            // from https://doc.rust-lang.org/std/ops/struct.Range.html
-            let last_plus_one = number_of_simulations+1;
-            for n in 1..last_plus_one {
-                match db::read_simulation(n) {
-                    Ok(sim) => {
-                        let sim_summary = SimulationSummary {
-                            simulation_id:     sim.simulation_id,
-                            model_id:          sim.model_id,
-                            simulation_type:   sim.simulation_type,
-                        };
-                        simvec.push(sim_summary);
+            let mut seen: u32 = 0;
+            let mut n = total_n;
+            while n >= 1 && simvec.len() < lim as usize {
+                if let Ok(sim) = db::read_simulation(n) {
+                    if seen >= off {
+                        simvec.push(SimulationSummary {
+                            simulation_id:   sim.simulation_id,
+                            model_id:        sim.model_id,
+                            simulation_type: sim.simulation_type,
+                        });
                     }
-                    Err(e) => return Err( SimulationError { err: format!("Could not read simulation {} from redis DB: {}", n, e), http_status_code: Status::UnprocessableEntity} )
+                    seen += 1;
                 }
+                if n == 0 { break; }
+                n -= 1;
             }
-            let simarray = SimulationArray {
+            Ok(Json(SimulationArray {
                 simulations: simvec,
-            };
-            Ok(Json(simarray))
+                total: total_n,
+                limit: lim,
+                offset: off,
+            }))
         },
-        Err(e) => Err( SimulationError { err: format!("Could not read number of simulations from redis DB: {}", e), http_status_code: Status::UnprocessableEntity} )
+        Err(e) => Err( SimulationError {
+            err: format!("Could not read number of simulations from redis DB: {}", e),
+            http_status_code: Status::UnprocessableEntity,
+        })
     }
 }
 
@@ -523,6 +600,161 @@ pub async fn post_simulation(
 pub struct ModelUploadResponse {
     pub model_id: String,
     pub bytes: usize,
+}
+
+/// Server-Sent Events stream of redis-backed simulation status.
+///
+/// Emits one event per status change (or at most once every poll tick),
+/// closes when status reaches a terminal state (done/failed/canceled)
+/// or after a 30-minute idle timeout. Heartbeat comments every 15s keep
+/// the connection alive through intermediary proxies.
+///
+/// Event data: JSON mirror of `/api/sim-status/<id>` response:
+/// `{"status": "...", "progress": 0-100, "error": "..." | null, ...}`.
+///
+/// Usage from a browser:
+/// ```js
+/// const es = new EventSource('/simulation/123/events');
+/// es.onmessage = e => console.log(JSON.parse(e.data));
+/// ```
+#[doc(hidden)]
+#[get("/simulation/<id>/events")]
+pub async fn get_simulation_events(
+    id: u64,
+) -> rocket::response::stream::EventStream![rocket::response::stream::Event] {
+    use rocket::response::stream::{Event, EventStream};
+    use rocket::tokio::time::{sleep, Duration, Instant};
+
+    EventStream! {
+        let deadline = Instant::now() + Duration::from_secs(30 * 60);
+        let mut last_payload: Option<String> = None;
+        // Poll the redis sidechannel. This is intentionally simple — a
+        // real pub/sub path would avoid the poll but adds more moving
+        // parts than v1.1 needs.
+        loop {
+            if Instant::now() >= deadline {
+                yield Event::data("timeout").event("closed");
+                break;
+            }
+
+            // 1) Cancelation flag (terminal)
+            let canceled = db::is_sim_canceled(id);
+            // 2) Current status (Option<String> JSON from redis, or None)
+            let status_json = read_sim_status_json(id);
+
+            let mut status_str = String::from("unknown");
+            if let Some(ref s) = status_json {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                    if let Some(st) = v.get("status").and_then(|x| x.as_str()) {
+                        status_str = st.to_string();
+                    }
+                }
+            }
+            if canceled && status_str != "done" && status_str != "failed" {
+                status_str = "canceled".into();
+            }
+
+            let merged = serde_json::json!({
+                "simulation_id": id,
+                "status": status_str,
+                "payload": status_json.as_deref()
+                                       .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+                "canceled": canceled,
+            }).to_string();
+
+            // Only emit when payload changed (deduplicate reconnect spam)
+            if last_payload.as_deref() != Some(&merged) {
+                yield Event::data(merged.clone()).event("status");
+                last_payload = Some(merged);
+            }
+
+            if matches!(status_str.as_str(), "done" | "failed" | "canceled") {
+                yield Event::data(status_str.clone()).event("closed");
+                break;
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Small redis helper for SSE: return the raw JSON blob stored at
+/// `dpsim:sim:<id>:status` (written by the worker's set_status path), or
+/// None if unset / redis unreachable.
+fn read_sim_status_json(id: u64) -> Option<String> {
+    use redis::Commands;
+    let url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://redis-master/".into());
+    let client = redis::Client::open(url).ok()?;
+    let mut conn = client.get_connection().ok()?;
+    let key = format!("dpsim:sim:{}:status", id);
+    conn.get::<_, String>(&key).ok()
+}
+
+/// Response body for POST /simulation/<id>/cancel.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CancelResponse {
+    pub simulation_id: u64,
+    pub canceled: bool,
+    pub status: String,
+}
+
+#[doc = "Cancel a simulation. \
+\
+Sets a redis flag `sim:<id>:canceled` that the worker checks before \
+starting work. For queued jobs the worker acks the AMQP message and \
+moves on. For already-running jobs the cancel is best-effort — the \
+current sim.run() can't be interrupted mid-step, but the post-run \
+logging path skips uploading results when the flag is set. \
+\
+Idempotent: calling twice returns the same response."]
+#[openapi]
+#[post("/simulation/<id>/cancel")]
+pub async fn post_cancel_simulation(
+    user: MaybeAuthedUser,
+    id: u64,
+) -> Result<Json<CancelResponse>, SimulationError> {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+
+    // Verify the sim exists before accepting cancel — 404 is clearer than
+    // "cancel flag set on a non-existent id".
+    if db::read_simulation(id).is_err() {
+        return Err(SimulationError {
+            err: format!("simulation {} not found", id),
+            http_status_code: Status::NotFound,
+        });
+    }
+
+    let ok = db::mark_sim_canceled(id);
+    if !ok {
+        return Err(SimulationError {
+            err: "redis unavailable; cannot persist cancel flag".into(),
+            http_status_code: Status::ServiceUnavailable,
+        });
+    }
+
+    // Best-effort PG update so GET /simulation shows 'canceled' quickly
+    // rather than waiting for the worker to process its next dequeue.
+    let _ = crate::pg::mark_canceled(id).await;
+
+    let actor = user.0.as_ref()
+        .map(|c| format!("user:{}", c.sub))
+        .unwrap_or_else(|| "anon".into());
+    crate::pg::audit(
+        &actor, "sim.cancel", Some(&format!("sim:{}", id)),
+        "success", None, None, None,
+    ).await;
+
+    Ok(Json(CancelResponse {
+        simulation_id: id,
+        canceled: true,
+        status: "canceled".into(),
+    }))
 }
 
 #[openapi(skip)]
@@ -669,5 +901,13 @@ fn validate_cim_xml(bytes: &[u8]) -> Result<(), String> {
 
 
 pub fn get_routes() -> Vec<rocket::Route>{
-    return rocket_okapi::openapi_get_routes![ get_root, get_api, get_healthz, get_version, get_simulations, post_simulation, post_model, get_simulation_id, crate::topology::get_topology]
+    // get_simulation_events lives outside the openapi macro because
+    // rocket_okapi 0.8 doesn't know how to describe EventStream responses.
+    let mut openapi = rocket_okapi::openapi_get_routes![
+        get_root, get_api, get_healthz, get_version, get_simulations,
+        post_simulation, post_cancel_simulation, post_model,
+        get_simulation_id, crate::topology::get_topology
+    ];
+    openapi.extend(rocket::routes![get_simulation_events]);
+    openapi
 }

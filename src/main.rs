@@ -91,6 +91,8 @@ mod db {
     pub fn is_token_sig_revoked(_sig: &str) -> bool { false }
     /// Stub: redis unreachable in tests, so caller falls back to in-memory.
     pub fn rate_limit_hit(_bucket: &str, _window_secs: u64) -> Option<u64> { None }
+    pub fn mark_sim_canceled(_sim_id: u64) -> bool { true }
+    pub fn is_sim_canceled(_sim_id: u64) -> bool { false }
     pub fn read_simulation(_key: u64) -> redis::RedisResult<Simulation> {
         Ok(Simulation {
                error:           "".to_owned(),

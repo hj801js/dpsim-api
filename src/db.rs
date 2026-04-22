@@ -77,6 +77,23 @@ end
 return count
 "#;
 
+// ---------------------------------------------------------------------------
+// Simulation cancel flag (v1.1.3). Worker checks `sim:<id>:canceled` before
+// starting work; if present, acknowledges the AMQP message and skips.
+// 30-day TTL so redis doesn't grow unbounded with old flags.
+// ---------------------------------------------------------------------------
+pub fn mark_sim_canceled(sim_id: u64) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("sim:{}:canceled", sim_id);
+    conn.set_ex::<_, _, ()>(key, "1", 30 * 24 * 3600).is_ok()
+}
+
+pub fn is_sim_canceled(sim_id: u64) -> bool {
+    let Ok(mut conn) = get_connection() else { return false };
+    let key = format!("sim:{}:canceled", sim_id);
+    conn.exists(key).unwrap_or(false)
+}
+
 pub fn rate_limit_hit(bucket: &str, window_secs: u64) -> Option<u64> {
     let mut conn = get_connection().ok()?;
     let key = format!("rl:{}", bucket);
