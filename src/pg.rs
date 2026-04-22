@@ -154,50 +154,81 @@ pub async fn get_user_by_email(
     Ok(row.map(|(uuid, em, hash)| (uuid.to_string(), em, hash)))
 }
 
+/// Optional filters for list_recent (v1.2.2).
+/// All fields nil → behave as the v1.1.1 list (no filtering beyond user scope).
+#[derive(Default, Debug, Clone)]
+pub struct ListFilters {
+    pub status:   Option<String>,   // queued | running | done | failed | canceled
+    pub domain:   Option<String>,   // SP | DP | EMT
+    pub model_id: Option<String>,   // exact match on the opaque model id
+}
+
 /// Return `limit` simulations starting at `offset`, scoped to a user if
-/// supplied. Returns (rows, total_count). None when PG disabled.
+/// supplied and filtered per `filters`. Returns (rows, total_count) where
+/// `total_count` reflects the filtered set, not the full table, so UIs
+/// can render accurate "X of N" even under a filter. None when PG disabled.
 pub async fn list_recent(
     limit: i64,
     offset: i64,
     user_sub: Option<&str>,
+    filters: &ListFilters,
 ) -> Option<(Vec<SimulationSummary>, i64)> {
     let p = pool().await?;
     let uid_opt = user_sub.and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
 
-    let (rows, total): (Vec<(i64, String, String)>, i64) = match uid_opt {
-        Some(uid) => {
-            let rows = sqlx::query_as(
-                "SELECT simulation_id, model_id, simulation_type
-                   FROM simulations
-                  WHERE user_id = $3
-                  ORDER BY created_at DESC
-                  LIMIT $1 OFFSET $2",
-            )
-            .bind(limit).bind(offset).bind(uid)
-            .fetch_all(&p).await.ok()?;
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM simulations WHERE user_id = $1",
-            )
-            .bind(uid).fetch_one(&p).await.ok()?;
-            (rows, total)
+    // Build WHERE clause dynamically. Binding indices shift with each
+    // appended filter; we track them via a counter to avoid off-by-one.
+    // Note: sqlx doesn't have a QueryBuilder we can reuse across query_as
+    // and query_scalar cleanly at this version, so we interpolate the
+    // `WHERE` fragments (with bound placeholders) into both statements.
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut idx = 3i32; // $1 = limit, $2 = offset; filters start at $3
+    where_parts.push(match uid_opt {
+        Some(_) => {
+            let p = format!("user_id = ${}", idx); idx += 1; p
         }
-        None => {
-            let rows = sqlx::query_as(
-                "SELECT simulation_id, model_id, simulation_type
-                   FROM simulations
-                  WHERE user_id IS NULL
-                  ORDER BY created_at DESC
-                  LIMIT $1 OFFSET $2",
-            )
-            .bind(limit).bind(offset)
-            .fetch_all(&p).await.ok()?;
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM simulations WHERE user_id IS NULL",
-            )
-            .fetch_one(&p).await.ok()?;
-            (rows, total)
-        }
-    };
+        None => "user_id IS NULL".to_string(),
+    });
+    let filter_status = filters.status.clone().filter(|s| !s.is_empty());
+    let filter_domain = filters.domain.clone().filter(|s| !s.is_empty());
+    let filter_model  = filters.model_id.clone().filter(|s| !s.is_empty());
+    if filter_status.is_some() { where_parts.push(format!("status = ${}", idx)); idx += 1; }
+    if filter_domain.is_some() { where_parts.push(format!("domain = ${}", idx)); idx += 1; }
+    if filter_model.is_some()  { where_parts.push(format!("model_id = ${}", idx)); idx += 1; }
+    let _ = idx; // final value intentionally unused — counter is write-only past this point
+    let where_sql = where_parts.join(" AND ");
+
+    let list_sql = format!(
+        "SELECT simulation_id, model_id, simulation_type \
+           FROM simulations \
+          WHERE {} \
+          ORDER BY created_at DESC \
+          LIMIT $1 OFFSET $2",
+        where_sql,
+    );
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM simulations WHERE {}",
+        // count's param indices are shifted by 2 (no limit/offset). Rebuild
+        // the same where clause but starting at $1 instead of $3.
+        rebase_where_indices(&where_sql, -2),
+    );
+
+    // Bind filter values to both queries in the same order we appended them.
+    let mut q = sqlx::query_as::<_, (i64, String, String)>(&list_sql)
+        .bind(limit)
+        .bind(offset);
+    if let Some(uid) = uid_opt { q = q.bind(uid); }
+    if let Some(ref s) = filter_status { q = q.bind(s); }
+    if let Some(ref d) = filter_domain { q = q.bind(d); }
+    if let Some(ref m) = filter_model  { q = q.bind(m); }
+    let rows = q.fetch_all(&p).await.ok()?;
+
+    let mut qc = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(uid) = uid_opt { qc = qc.bind(uid); }
+    if let Some(ref s) = filter_status { qc = qc.bind(s); }
+    if let Some(ref d) = filter_domain { qc = qc.bind(d); }
+    if let Some(ref m) = filter_model  { qc = qc.bind(m); }
+    let total: i64 = qc.fetch_one(&p).await.ok()?;
 
     Some((
         rows.into_iter()
@@ -212,6 +243,35 @@ pub async fn list_recent(
             .collect(),
         total,
     ))
+}
+
+/// Shift `$N` placeholders in a WHERE clause by `delta` so the same
+/// fragment works in the list query (params start at $3) and the count
+/// query (params start at $1). Negative delta moves indices down.
+fn rebase_where_indices(sql: &str, delta: i32) -> String {
+    // Simple single-pass rewriter: match `$<digits>` and replace with
+    // `$<digits + delta>`. Good enough for our controlled input.
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '$' && i + 1 < bytes.len() && bytes[i+1].is_ascii_digit() {
+            out.push('$');
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let n: i32 = std::str::from_utf8(&bytes[start..end]).unwrap().parse().unwrap();
+            out.push_str(&(n + delta).to_string());
+            i = end;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Mark a simulation canceled in PG (v1.1.3). Best-effort; the real source

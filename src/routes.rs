@@ -375,13 +375,77 @@ pub async fn get_root() -> Redirect {
 }
 
 #[openapi(skip)]
-#[doc = "Liveness probe — returns 200 \"ok\" when the HTTP handler is reachable. \
-         Intended for Makefile/container readiness checks. Upgrade to a real \
-         readiness probe (redis + AMQP) when ops needs it."]
+#[doc = "Liveness probe — returns 200 \"ok\" when the HTTP handler is reachable.\
+         Doesn't check downstream dependencies: use /readyz for that."]
 #[get("/healthz")]
 pub async fn get_healthz() -> &'static str {
     "ok"
 }
+
+/// Body of /readyz so each component's state is machine-readable.
+#[derive(Serialize, JsonSchema)]
+pub struct ReadyzResponse {
+    pub ready:    bool,
+    pub redis:    bool,
+    pub postgres: bool,
+    pub amqp:     bool,
+}
+
+#[doc = "Readiness probe — returns 200 only when all critical dependencies \
+         are reachable: redis (rate-limit + sim store), PG (audit log + user \
+         store; skipped when DATABASE_URL unset), and AMQP (worker queue). \
+         Returns 503 with the per-component breakdown when any check fails. \
+         Point kubernetes readinessProbe at this instead of /healthz."]
+#[openapi]
+#[get("/readyz")]
+pub async fn get_readyz() -> (Status, Json<ReadyzResponse>) {
+    // Redis: ping via rate-limit hit on a throwaway bucket. Cheap, avoids
+    // a second helper and exercises the Lua-script path we care about.
+    let redis_ok = db::rate_limit_hit("readyz_probe", 5).is_some();
+
+    // Postgres: None pool = DATABASE_URL unset, which means PG is
+    // explicitly disabled — treat as "not required" rather than failure
+    // so single-node deployments without PG stay ready.
+    let pg_ok = match pg::pool().await {
+        Some(p) => sqlx::query("SELECT 1").execute(&p).await.is_ok(),
+        None    => true,
+    };
+
+    // AMQP: cheap Connection::connect() + close. Reuses the same env var
+    // as the publish path so the check and the real work agree on target.
+    let amqp_ok = amqp_reachable().await;
+
+    let ready = redis_ok && pg_ok && amqp_ok;
+    let body = ReadyzResponse {
+        ready,
+        redis:    redis_ok,
+        postgres: pg_ok,
+        amqp:     amqp_ok,
+    };
+    let status = if ready { Status::Ok } else { Status::ServiceUnavailable };
+    (status, Json(body))
+}
+
+#[cfg(not(test))]
+async fn amqp_reachable() -> bool {
+    let addr = std::env::var("AMQP_ADDR")
+        .unwrap_or_else(|_| "amqp://rabbitmq:5672/%2f".into());
+    match lapin::Connection::connect(
+        &addr,
+        lapin::ConnectionProperties::default().with_default_executor(1),
+    ).await {
+        Ok(conn) => {
+            let _ = conn.close(200, "readyz").await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// Tests never have AMQP running; pretend the broker is up so test_healthz
+// stays as a pure HTTP probe. Realness checked in non-test builds.
+#[cfg(test)]
+async fn amqp_reachable() -> bool { true }
 
 #[openapi(skip)]
 #[doc = "Version probe — returns build-time package version + short git SHA so \
@@ -451,13 +515,19 @@ pub struct SimulationArray {
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 500;
 
-#[doc = "List the simulations. Supports `?limit=N&offset=N`."]
+#[doc = "List simulations. Pagination via `?limit=N&offset=N` (default 50, \
+         max 500). Optional filters: `?status=queued|running|done|failed|canceled`, \
+         `?domain=SP|DP|EMT`, `?model_id=<id>`. Filters require PG — they \
+         are ignored on the redis fallback path."]
 #[openapi]
-#[get("/simulation?<limit>&<offset>", format="application/json")]
+#[get("/simulation?<limit>&<offset>&<status>&<domain>&<model_id>", format="application/json")]
 pub async fn get_simulations(
     user: MaybeAuthedUser,
     limit: Option<u32>,
     offset: Option<u32>,
+    status: Option<String>,
+    domain: Option<String>,
+    model_id: Option<String>,
 ) -> Result<Json<SimulationArray>, SimulationError> {
     if auth_required() && user.0.is_none() {
         return Err(SimulationError {
@@ -467,11 +537,12 @@ pub async fn get_simulations(
     }
     let lim = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let off = offset.unwrap_or(0);
+    let filters = pg::ListFilters { status, domain, model_id };
 
     // Prefer PG (survives redis flush, supports per-user filtering + offset).
     // Fall back to the legacy redis scan when PG is off or the query fails.
     let user_sub = user.0.as_ref().map(|c| c.sub.as_str());
-    if let Some((summaries, total)) = pg::list_recent(lim as i64, off as i64, user_sub).await {
+    if let Some((summaries, total)) = pg::list_recent(lim as i64, off as i64, user_sub, &filters).await {
         return Ok(Json(SimulationArray {
             simulations: summaries,
             total: total.max(0) as u64,
@@ -904,9 +975,9 @@ pub fn get_routes() -> Vec<rocket::Route>{
     // get_simulation_events lives outside the openapi macro because
     // rocket_okapi 0.8 doesn't know how to describe EventStream responses.
     let mut openapi = rocket_okapi::openapi_get_routes![
-        get_root, get_api, get_healthz, get_version, get_simulations,
-        post_simulation, post_cancel_simulation, post_model,
-        get_simulation_id, crate::topology::get_topology
+        get_root, get_api, get_healthz, get_readyz, get_version,
+        get_simulations, post_simulation, post_cancel_simulation,
+        post_model, get_simulation_id, crate::topology::get_topology
     ];
     openapi.extend(rocket::routes![get_simulation_events]);
     openapi

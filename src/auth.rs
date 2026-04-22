@@ -228,15 +228,57 @@ impl<'r> OpenApiFromRequest<'r> for BearerToken {
     }
 }
 
-/// Guard that exposes Rocket's `Request::client_ip()` — used to key the
-/// per-IP rate-limit bucket on /auth/signup + /auth/login. Always succeeds
-/// with `None` behind the Rocket test client (no peer socket).
+/// Guard that resolves the true client IP, honoring proxy headers when
+/// `DPSIM_TRUST_PROXY_HEADERS=1` is set. Used to key the per-IP rate-limit
+/// bucket on /auth/signup + /auth/login.
+///
+/// Trust model:
+///   - Default (env unset or "0"): only `Request::client_ip()` — the TCP
+///     peer. Safe behind a direct deployment.
+///   - Opt-in (`DPSIM_TRUST_PROXY_HEADERS=1`): prefer the first entry of
+///     `X-Forwarded-For` (comma-separated, leftmost = originating
+///     client), falling back to `X-Real-IP`, then the TCP peer. Only
+///     enable this when the dpsim-api instance sits behind a trusted
+///     reverse proxy / ingress that strips client-supplied copies of
+///     the header. Otherwise a malicious client could spoof their IP
+///     by sending a custom `X-Forwarded-For`.
+///
+/// Always returns `None` behind the Rocket test client (no peer socket,
+/// no proxy headers).
 pub struct ClientIp(pub Option<std::net::IpAddr>);
+
+fn trust_proxy_headers() -> bool {
+    matches!(
+        std::env::var("DPSIM_TRUST_PROXY_HEADERS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+fn parse_ip_hdr(v: &str) -> Option<std::net::IpAddr> {
+    // X-Forwarded-For can be a chain: "client, proxy1, proxy2". Take the
+    // first entry (the originating client). Trim whitespace and surrounding
+    // brackets common in IPv6 logging. Return None if it doesn't parse.
+    let head = v.split(',').next()?.trim();
+    let stripped = head.trim_start_matches('[').trim_end_matches(']');
+    stripped.parse().ok()
+}
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for ClientIp {
     type Error = ();
     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        if trust_proxy_headers() {
+            if let Some(xff) = req.headers().get_one("X-Forwarded-For") {
+                if let Some(ip) = parse_ip_hdr(xff) {
+                    return Outcome::Success(ClientIp(Some(ip)));
+                }
+            }
+            if let Some(xri) = req.headers().get_one("X-Real-IP") {
+                if let Some(ip) = parse_ip_hdr(xri) {
+                    return Outcome::Success(ClientIp(Some(ip)));
+                }
+            }
+        }
         Outcome::Success(ClientIp(req.client_ip()))
     }
 }
