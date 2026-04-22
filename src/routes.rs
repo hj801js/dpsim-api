@@ -56,6 +56,16 @@ pub struct SimulationSummary {
     pub simulation_id:     u64,
     pub model_id:          String,
     pub simulation_type:   SimulationType,
+    // v1.2.6 — enrich summary so the UI doesn't need a follow-up
+    // /api/sim-status/<id> call per row. All three fields are optional
+    // to keep the shape compatible with v1.1 clients that only parse
+    // the three canonical fields above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status:            Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain:            Option<DomainType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine:            Option<EngineType>,
 }
 
 #[doc = "Enum for the various Simulation types"]
@@ -566,6 +576,13 @@ pub async fn get_simulations(
                             simulation_id:   sim.simulation_id,
                             model_id:        sim.model_id,
                             simulation_type: sim.simulation_type,
+                            // Redis path has no reliable status column —
+                            // leave summary enrichment null. UI can still
+                            // fetch /api/sim-status/<id> when it needs
+                            // the sidechannel.
+                            status: None,
+                            domain: Some(sim.domain),
+                            engine: Some(sim.engine),
                         });
                     }
                     seen += 1;
@@ -671,6 +688,115 @@ pub async fn post_simulation(
 pub struct ModelUploadResponse {
     pub model_id: String,
     pub bytes: usize,
+}
+
+/// v1.2.7 — re-submit a prior simulation under a fresh id. The source
+/// simulation is read from redis; its parameters become a new
+/// SimulationForm which is parsed through the normal validate + queue
+/// path. Useful after a `failed` result (user wants to rerun same
+/// params) or to replay a deterministic regression case.
+///
+/// 404 if the source id is unknown. 502 when AMQP publish fails. 400
+/// when the replayed params no longer pass validation (e.g. because
+/// the referenced model_id has been deleted from file-service).
+///
+/// The new sim has its own id, trace_id, and results_id — nothing
+/// ties it back to the source beyond the request that triggered it.
+/// Audit log records both ids so forensics can link them.
+#[openapi]
+#[post("/simulation/<id>/retry")]
+pub async fn post_retry_simulation(
+    user: MaybeAuthedUser,
+    req_span: crate::telemetry::RequestSpanCtx,
+    id: u64,
+) -> SimulationResult {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+    let source = match db::read_simulation(id) {
+        Ok(s) => s,
+        Err(_) => return Err(SimulationError {
+            err: format!("simulation {} not found", id),
+            http_status_code: Status::NotFound,
+        }),
+    };
+
+    // Rebuild the form shape. Load-factor / outage scenario hints aren't
+    // stored in the Simulation struct — the retry runs the "base" case
+    // the original submission would have produced without those extras.
+    // A future migration could persist them on the Simulation row to
+    // make retries byte-identical.
+    let form = SimulationForm {
+        simulation_type:    source.simulation_type,
+        model_id:           source.model_id.clone(),
+        load_profile_id:    source.load_profile_id.clone(),
+        domain:             source.domain,
+        solver:             source.solver,
+        timestep:           source.timestep,
+        finaltime:          source.finaltime,
+        outage_component:   None,
+        load_factor:        None,
+        load_factor_series: None,
+        engine:             source.engine,
+    };
+
+    let user_sub = user.0.as_ref().map(|c| c.sub.clone());
+    let simulation = parse_simulation_form(Json(form), user_sub.as_deref()).await?;
+
+    let model_url = file_service::convert_id_to_url(&simulation.model_id).await?;
+    let mut load_profile_url = "".into();
+    if simulation.load_profile_id != "None" {
+        load_profile_url = file_service::convert_id_to_url(&simulation.load_profile_id).await?;
+    }
+
+    let amqp_sim = AMQPSimulation::from_simulation(
+        &simulation, model_url, load_profile_url, None, None, None,
+    );
+    let span_ctx = req_span.0.clone()
+        .or_else(crate::telemetry::start_post_simulation_span);
+    let traceparent = span_ctx.as_ref()
+        .and_then(crate::telemetry::span_context_to_traceparent);
+
+    let actor = user_sub.as_deref()
+        .map(|s| format!("user:{}", s))
+        .unwrap_or_else(|| "anon".into());
+    let target = format!("sim:{}", simulation.simulation_id);
+    let trace_id = simulation.trace_id.clone();
+
+    match amqp::request_simulation_with_traceparent(
+        &amqp_sim, &simulation.trace_id, traceparent,
+    ).await {
+        Ok(()) => {
+            crate::pg::audit(
+                &actor, "sim.retry", Some(&target), "success",
+                Some(&trace_id), None,
+                Some(serde_json::json!({
+                    "source_sim_id": id,
+                    "model_id": simulation.model_id,
+                    "engine": simulation.engine,
+                    "domain": simulation.domain,
+                })),
+            ).await;
+            Ok(simulation)
+        }
+        Err(e) => {
+            crate::pg::audit(
+                &actor, "sim.retry", Some(&target), "failure",
+                Some(&trace_id), None,
+                Some(serde_json::json!({
+                    "source_sim_id": id,
+                    "error": format!("{}", e),
+                })),
+            ).await;
+            Err(SimulationError {
+                err: format!("Could not publish retry to amqp server: {}", e),
+                http_status_code: Status::BadGateway,
+            })
+        }
+    }
 }
 
 /// Server-Sent Events stream of redis-backed simulation status.
@@ -977,7 +1103,8 @@ pub fn get_routes() -> Vec<rocket::Route>{
     let mut openapi = rocket_okapi::openapi_get_routes![
         get_root, get_api, get_healthz, get_readyz, get_version,
         get_simulations, post_simulation, post_cancel_simulation,
-        post_model, get_simulation_id, crate::topology::get_topology
+        post_retry_simulation, post_model, get_simulation_id,
+        crate::topology::get_topology
     ];
     openapi.extend(rocket::routes![get_simulation_events]);
     openapi

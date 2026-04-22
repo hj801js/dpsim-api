@@ -198,8 +198,13 @@ pub async fn list_recent(
     let _ = idx; // final value intentionally unused — counter is write-only past this point
     let where_sql = where_parts.join(" AND ");
 
+    // v1.2.6 — pull status + domain so SimulationSummary can carry them,
+    // eliminating the UI's per-row /api/sim-status fetch. `engine` column
+    // doesn't exist in the schema yet (planned for a future migration);
+    // emit NULL until then and the summary leaves Option::None.
     let list_sql = format!(
-        "SELECT simulation_id, model_id, simulation_type \
+        "SELECT simulation_id, model_id, simulation_type, \
+                status, domain \
            FROM simulations \
           WHERE {} \
           ORDER BY created_at DESC \
@@ -214,7 +219,7 @@ pub async fn list_recent(
     );
 
     // Bind filter values to both queries in the same order we appended them.
-    let mut q = sqlx::query_as::<_, (i64, String, String)>(&list_sql)
+    let mut q = sqlx::query_as::<_, (i64, String, String, String, String)>(&list_sql)
         .bind(limit)
         .bind(offset);
     if let Some(uid) = uid_opt { q = q.bind(uid); }
@@ -232,13 +237,24 @@ pub async fn list_recent(
 
     Some((
         rows.into_iter()
-            .map(|(sid, mid, stype)| SimulationSummary {
+            .map(|(sid, mid, stype, status, domain)| SimulationSummary {
                 simulation_id: sid as u64,
                 model_id:      mid,
                 simulation_type: match stype.as_str() {
                     "Outage" => crate::routes::SimulationType::Outage,
                     _        => crate::routes::SimulationType::Powerflow,
                 },
+                status: if status.is_empty() { None } else { Some(status) },
+                domain: match domain.as_str() {
+                    "SP"  => Some(crate::routes::DomainType::SP),
+                    "DP"  => Some(crate::routes::DomainType::DP),
+                    "EMT" => Some(crate::routes::DomainType::EMT),
+                    _     => None,
+                },
+                // engine column not in PG schema yet — populated in a
+                // future migration. For now `engine` on the summary is
+                // always None; per-sim GET still carries it.
+                engine: None,
             })
             .collect(),
         total,

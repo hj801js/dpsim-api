@@ -32,6 +32,12 @@ fn test_get_simulations() {
         simulation_id:   1,
         model_id:        "1".to_string(),
         simulation_type: SimulationType::Powerflow,
+        // v1.2.6 redis-fallback path populates these from the Simulation
+        // stub (DomainType::SP, EngineType::Dpsim). Status stays None
+        // because the test stub doesn't carry a sidechannel value.
+        status:          None,
+        domain:          Some(DomainType::SP),
+        engine:          Some(EngineType::Dpsim),
     };
     assert_json_eq!(received_simulation_summary, expected_simulation_summary)
 }
