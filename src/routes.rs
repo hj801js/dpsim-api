@@ -527,10 +527,12 @@ const MAX_LIMIT: u32 = 500;
 
 #[doc = "List simulations. Pagination via `?limit=N&offset=N` (default 50, \
          max 500). Optional filters: `?status=queued|running|done|failed|canceled`, \
-         `?domain=SP|DP|EMT`, `?model_id=<id>`. Filters require PG — they \
-         are ignored on the redis fallback path."]
+         `?domain=SP|DP|EMT`, `?model_id=<id>`. Sort via `?sort=simulation_id|\
+         created_at|status|domain` + `?order=asc|desc` (default `created_at \
+         desc`). Filters + sort require PG — they are ignored on the redis \
+         fallback path."]
 #[openapi]
-#[get("/simulation?<limit>&<offset>&<status>&<domain>&<model_id>", format="application/json")]
+#[get("/simulation?<limit>&<offset>&<status>&<domain>&<model_id>&<sort>&<order>", format="application/json")]
 pub async fn get_simulations(
     user: MaybeAuthedUser,
     limit: Option<u32>,
@@ -538,6 +540,8 @@ pub async fn get_simulations(
     status: Option<String>,
     domain: Option<String>,
     model_id: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
 ) -> Result<Json<SimulationArray>, SimulationError> {
     if auth_required() && user.0.is_none() {
         return Err(SimulationError {
@@ -548,11 +552,12 @@ pub async fn get_simulations(
     let lim = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let off = offset.unwrap_or(0);
     let filters = pg::ListFilters { status, domain, model_id };
+    let sort_opts = pg::ListSort { key: sort, order };
 
     // Prefer PG (survives redis flush, supports per-user filtering + offset).
     // Fall back to the legacy redis scan when PG is off or the query fails.
     let user_sub = user.0.as_ref().map(|c| c.sub.as_str());
-    if let Some((summaries, total)) = pg::list_recent(lim as i64, off as i64, user_sub, &filters).await {
+    if let Some((summaries, total)) = pg::list_recent(lim as i64, off as i64, user_sub, &filters, &sort_opts).await {
         return Ok(Json(SimulationArray {
             simulations: summaries,
             total: total.max(0) as u64,
@@ -688,6 +693,187 @@ pub async fn post_simulation(
 pub struct ModelUploadResponse {
     pub model_id: String,
     pub bytes: usize,
+}
+
+/// v1.2.8 — bulk submit request. Typical use: outage sweep or N-1
+/// contingency study (one form per outage component).
+#[derive(Deserialize, JsonSchema)]
+pub struct BulkSubmitRequest {
+    pub simulations: Vec<SimulationForm>,
+}
+
+/// Per-item outcome for /simulation/bulk. Either `simulation` is populated
+/// (submitted + queued) or `error` is (validation / AMQP failure). `index`
+/// mirrors the request-array position so the client can correlate.
+#[derive(Serialize, JsonSchema)]
+pub struct BulkSubmitItem {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub simulation: Option<Simulation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code:  Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct BulkSubmitResponse {
+    pub submitted: usize,
+    pub failed:    usize,
+    pub results:   Vec<BulkSubmitItem>,
+}
+
+/// Protect the AMQP queue + file-service from a runaway bulk. Forms are
+/// validated + queued serially (redis INCR + file-service round-trip)
+/// so even 500 items runs in single-digit seconds.
+const BULK_MAX_ITEMS: usize = 500;
+
+#[doc = "Submit multiple simulations in one request. Each item is \
+validated + queued independently; the response reports per-item \
+success/failure so a partially-successful batch still delivers the \
+queued sims. Capped at 500 items per request."]
+#[openapi]
+#[post("/simulation/bulk", format = "application/json", data = "<body>")]
+pub async fn post_bulk_simulation(
+    user: MaybeAuthedUser,
+    req_span: crate::telemetry::RequestSpanCtx,
+    body: Json<BulkSubmitRequest>,
+) -> Result<Json<BulkSubmitResponse>, SimulationError> {
+    if auth_required() && user.0.is_none() {
+        return Err(SimulationError {
+            err: "authentication required".into(),
+            http_status_code: Status::Unauthorized,
+        });
+    }
+    if body.simulations.len() > BULK_MAX_ITEMS {
+        return Err(SimulationError {
+            err: format!(
+                "bulk limit is {} simulations per request (got {})",
+                BULK_MAX_ITEMS, body.simulations.len(),
+            ),
+            http_status_code: Status::BadRequest,
+        });
+    }
+    if body.simulations.is_empty() {
+        return Err(SimulationError {
+            err: "bulk request contained no simulations".into(),
+            http_status_code: Status::BadRequest,
+        });
+    }
+
+    let user_sub = user.0.as_ref().map(|c| c.sub.clone());
+    let span_ctx = req_span.0.clone()
+        .or_else(crate::telemetry::start_post_simulation_span);
+    let traceparent = span_ctx.as_ref()
+        .and_then(crate::telemetry::span_context_to_traceparent);
+    let actor = user_sub.as_deref()
+        .map(|s| format!("user:{}", s))
+        .unwrap_or_else(|| "anon".into());
+
+    let mut results: Vec<BulkSubmitItem> = Vec::with_capacity(body.simulations.len());
+    let mut submitted = 0usize;
+    let mut failed    = 0usize;
+
+    // Serial iteration — redis INCR for sim id is already serialized,
+    // file-service calls are I/O-bound but tiny, and serial simplifies
+    // the audit trail and partial-failure semantics.
+    for (i, form) in body.into_inner().simulations.into_iter().enumerate() {
+        // Save scenario hints before move.
+        let form_outage = form.outage_component.clone();
+        let form_load_factor = form.load_factor;
+        let form_load_series = form.load_factor_series.clone();
+
+        let parsed = match parse_simulation_form(Json(form), user_sub.as_deref()).await {
+            Ok(s) => s,
+            Err(e) => {
+                results.push(BulkSubmitItem {
+                    index: i, simulation: None,
+                    error: Some(e.err.clone()),
+                    code:  Some(default_code_for(e.http_status_code).to_string()),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        let model_url = match file_service::convert_id_to_url(&parsed.model_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                results.push(BulkSubmitItem {
+                    index: i, simulation: None,
+                    error: Some(format!("file-service: {}", e)),
+                    code:  Some("ERR_UPSTREAM".into()),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+        let mut load_profile_url = String::new();
+        if parsed.load_profile_id != "None" {
+            load_profile_url = match file_service::convert_id_to_url(&parsed.load_profile_id).await {
+                Ok(u) => u,
+                Err(e) => {
+                    results.push(BulkSubmitItem {
+                        index: i, simulation: None,
+                        error: Some(format!("file-service (load profile): {}", e)),
+                        code:  Some("ERR_UPSTREAM".into()),
+                    });
+                    failed += 1;
+                    continue;
+                }
+            };
+        }
+
+        let amqp_sim = AMQPSimulation::from_simulation(
+            &parsed, model_url, load_profile_url, form_outage,
+            form_load_factor, form_load_series,
+        );
+
+        let target = format!("sim:{}", parsed.simulation_id);
+        let trace_id = parsed.trace_id.clone();
+        match amqp::request_simulation_with_traceparent(
+            &amqp_sim, &parsed.trace_id, traceparent.clone(),
+        ).await {
+            Ok(()) => {
+                crate::pg::audit(
+                    &actor, "sim.submit", Some(&target), "success",
+                    Some(&trace_id), None,
+                    Some(serde_json::json!({
+                        "via": "bulk", "index": i,
+                        "model_id": parsed.model_id,
+                        "engine": parsed.engine,
+                        "domain": parsed.domain,
+                    })),
+                ).await;
+                // parsed is Json<Simulation> — extract the inner value.
+                let sim = parsed.into_inner();
+                results.push(BulkSubmitItem {
+                    index: i, simulation: Some(sim), error: None, code: None,
+                });
+                submitted += 1;
+            }
+            Err(e) => {
+                crate::pg::audit(
+                    &actor, "sim.submit", Some(&target), "failure",
+                    Some(&trace_id), None,
+                    Some(serde_json::json!({
+                        "via": "bulk", "index": i,
+                        "error": format!("{}", e),
+                    })),
+                ).await;
+                results.push(BulkSubmitItem {
+                    index: i, simulation: None,
+                    error: Some(format!("amqp publish failed: {}", e)),
+                    code:  Some("ERR_UPSTREAM".into()),
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(Json(BulkSubmitResponse {
+        submitted, failed, results,
+    }))
 }
 
 /// v1.2.7 — re-submit a prior simulation under a fresh id. The source
@@ -1102,9 +1288,9 @@ pub fn get_routes() -> Vec<rocket::Route>{
     // rocket_okapi 0.8 doesn't know how to describe EventStream responses.
     let mut openapi = rocket_okapi::openapi_get_routes![
         get_root, get_api, get_healthz, get_readyz, get_version,
-        get_simulations, post_simulation, post_cancel_simulation,
-        post_retry_simulation, post_model, get_simulation_id,
-        crate::topology::get_topology
+        get_simulations, post_simulation, post_bulk_simulation,
+        post_cancel_simulation, post_retry_simulation, post_model,
+        get_simulation_id, crate::topology::get_topology
     ];
     openapi.extend(rocket::routes![get_simulation_events]);
     openapi

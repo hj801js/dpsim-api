@@ -163,6 +163,45 @@ pub struct ListFilters {
     pub model_id: Option<String>,   // exact match on the opaque model id
 }
 
+/// Sort options for list_recent (v1.2.9). Allowlist-validated at the route
+/// layer so these strings are safe to interpolate into ORDER BY without
+/// parameter binding (PG forbids binding identifiers).
+#[derive(Default, Debug, Clone)]
+pub struct ListSort {
+    pub key:   Option<String>,   // "simulation_id" | "created_at" | "status" | "domain"
+    pub order: Option<String>,   // "asc" | "desc"
+}
+
+/// Resolve sort key + order to a safe `ORDER BY` fragment, defaulting to
+/// `created_at DESC`. Any input outside the allowlist silently degrades
+/// to the default so malformed params don't 400 the list endpoint.
+pub fn sort_fragment(sort: &ListSort) -> &'static str {
+    let key = match sort.key.as_deref() {
+        Some("simulation_id") => "simulation_id",
+        Some("created_at")    => "created_at",
+        Some("status")        => "status",
+        Some("domain")        => "domain",
+        _                     => "created_at",
+    };
+    let order = match sort.order.as_deref() {
+        Some("asc") | Some("ASC")   => "ASC",
+        _                           => "DESC",
+    };
+    // Static str table — only four keys × two orders, so enumerate to
+    // keep the return type `&'static str` (safe for format! interpolation).
+    match (key, order) {
+        ("simulation_id", "ASC")  => "simulation_id ASC",
+        ("simulation_id", "DESC") => "simulation_id DESC",
+        ("created_at",    "ASC")  => "created_at ASC",
+        ("created_at",    "DESC") => "created_at DESC",
+        ("status",        "ASC")  => "status ASC",
+        ("status",        "DESC") => "status DESC",
+        ("domain",        "ASC")  => "domain ASC",
+        ("domain",        "DESC") => "domain DESC",
+        _                         => "created_at DESC",
+    }
+}
+
 /// Return `limit` simulations starting at `offset`, scoped to a user if
 /// supplied and filtered per `filters`. Returns (rows, total_count) where
 /// `total_count` reflects the filtered set, not the full table, so UIs
@@ -172,6 +211,7 @@ pub async fn list_recent(
     offset: i64,
     user_sub: Option<&str>,
     filters: &ListFilters,
+    sort: &ListSort,
 ) -> Option<(Vec<SimulationSummary>, i64)> {
     let p = pool().await?;
     let uid_opt = user_sub.and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
@@ -207,9 +247,10 @@ pub async fn list_recent(
                 status, domain \
            FROM simulations \
           WHERE {} \
-          ORDER BY created_at DESC \
+          ORDER BY {} \
           LIMIT $1 OFFSET $2",
         where_sql,
+        sort_fragment(sort),
     );
     let count_sql = format!(
         "SELECT COUNT(*) FROM simulations WHERE {}",
