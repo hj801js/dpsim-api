@@ -290,6 +290,18 @@ impl From<InvalidUri> for SimulationError {
     }
 }
 
+/// v1.2.x hardening — file-service helpers now return a Box<dyn Error>
+/// instead of panicking on bad URIs / malformed responses. Map to 502 so
+/// the client can distinguish a file-service outage from a dpsim-api bug.
+impl From<file_service::FileServiceError> for SimulationError {
+    fn from(input: file_service::FileServiceError) -> Self {
+        SimulationError {
+            err: format!("file-service error: {}", input),
+            http_status_code: rocket::http::Status { code: 502 },
+        }
+    }
+}
+
 fn default_code_for(status: rocket::http::Status) -> &'static str {
     match status.code {
         400 => "ERR_BAD_REQUEST",
@@ -476,30 +488,35 @@ pub async fn get_version() -> Json<serde_json::Value> {
 pub async fn get_simulation_id(id: u64) -> SimulationResult {
     match db::read_simulation(id) {
         Ok(mut sim) => {
+            // Fetch the result CSV via file-service. Upstream failures now
+            // surface as 502 (was 401 — a bug; file-service errors had
+            // nothing to do with auth).
             let uri: String = match file_service::convert_id_to_url(&sim.results_id).await {
                 Ok(url) => url,
-                Err(e) => return Err( SimulationError {
-                                          err: format!("Could not read convert results id to url. Results id:{} Error: {}", sim.results_id, e),
-                                          http_status_code: Status::Unauthorized
-                                      })
+                Err(e) => return Err(SimulationError {
+                    err: format!("file-service: could not resolve results_id {}: {}", sim.results_id, e),
+                    http_status_code: Status::BadGateway,
+                }),
             };
-            let data = file_service::get_data_from_url(&uri).await;
-            let results: String = match data {
-                Ok(boxed_data) => {
-                    // Use from_utf8_lossy so a stray invalid byte in the CSV
-                    // doesn't panic the handler. dpsim CSV is ASCII in
-                    // practice; lossy conversion is a strictly-safer fallback.
-                    String::from_utf8_lossy(&boxed_data).into_owned()
-                },
-                Err(e) => return Err( SimulationError {
-                                          err: format!("Could not read results from url. Results id:{} Error: {}", sim.results_id, e),
-                                          http_status_code: Status::Unauthorized
-                                      })
+            let results: String = match file_service::get_data_from_url(&uri).await {
+                // Use from_utf8_lossy so a stray invalid byte in the CSV
+                // doesn't panic the handler. dpsim CSV is ASCII in
+                // practice; lossy conversion is a strictly-safer fallback.
+                Ok(boxed_data) => String::from_utf8_lossy(&boxed_data).into_owned(),
+                Err(e) => return Err(SimulationError {
+                    err: format!("file-service: could not fetch results for {}: {}", sim.results_id, e),
+                    http_status_code: Status::BadGateway,
+                }),
             };
             sim.results_data = results;
             Ok(Json(sim))
         },
-        Err(e) =>  Err( SimulationError { err: e.to_string(), http_status_code: Status::UnprocessableEntity } )
+        // Simulation id not in redis: 404, not 422. A missing row is a
+        // not-found condition from the client's POV.
+        Err(e) => Err(SimulationError {
+            err: format!("simulation {} not found: {}", id, e),
+            http_status_code: Status::NotFound,
+        }),
     }
 }
 
